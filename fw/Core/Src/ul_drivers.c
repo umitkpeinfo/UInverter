@@ -35,6 +35,41 @@ static volatile uint8_t _svpwm_enabled = 0;
 
 static volatile DrvState_t drv_state = DRV_STATE_IDLE;
 
+/* ── Diagnostic Code System ──────────────────────────────────────────────── */
+
+static volatile uint8_t    diag_code = DIAG_NONE;
+static DiagEntry_t         diag_history[DIAG_HISTORY_LEN];
+static uint8_t             diag_hist_count = 0;
+static uint8_t             diag_hist_head  = 0;
+
+/**
+ * Push a diagnostic code into the active slot and history ring buffer.
+ * Must be called with interrupts disabled OR from the highest-priority ISR.
+ */
+static void _diag_push(uint8_t code)
+{
+    diag_code = code;
+    uint8_t idx = diag_hist_head;
+    diag_history[idx].code    = code;
+    diag_history[idx].tick_ms = HAL_GetTick();
+    diag_hist_head = (idx + 1U) % DIAG_HISTORY_LEN;
+    if (diag_hist_count < DIAG_HISTORY_LEN)
+        diag_hist_count++;
+}
+
+uint8_t UL_Diag_GetCode(void) { return diag_code; }
+
+const DiagEntry_t *UL_Diag_GetHistory(uint8_t *count_out)
+{
+    if (count_out) *count_out = diag_hist_count;
+    return diag_history;
+}
+
+void UL_Diag_Clear(void)
+{
+    diag_code = DIAG_NONE;
+}
+
 /* ── Angle accumulator ───────────────────────────────────────────────── */
 
 /**
@@ -99,17 +134,19 @@ uint8_t  UL_Fault_IsTripped(void) { return fault_flags != FAULT_NONE ? 1U : 0U; 
 
 /**
  * Latch one or more fault bits and force a safe shutdown:
- *   1. Atomically OR mask into fault_flags (interrupt-safe against BKIN ISR)
+ *   1. Atomically OR mask into fault_flags and push diagnostic code
  *   2. Clear MOE → idle-state outputs (SET = HIGH → IGBTs OFF)
  *   3. Zero CCR so no duty is queued for the next cycle
  *   4. Open the charge relay to isolate the DC bus
  *   5. Transition drv_state to FAULT immediately (no tick delay)
  */
-void UL_Fault_Set(uint16_t mask)
+void UL_Fault_Set(uint16_t mask, uint8_t diag)
 {
     uint32_t primask = __get_PRIMASK();
     __disable_irq();
     fault_flags |= mask;
+    if (diag != DIAG_NONE)
+        _diag_push(diag);
     __set_PRIMASK(primask);
 
     TIM_TypeDef *tim = htim1.Instance;
@@ -136,6 +173,7 @@ void UL_Fault_Clear(void)
     _svpwm_enabled = 0;
 
     fault_flags = FAULT_NONE;
+    diag_code   = DIAG_NONE;
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -159,6 +197,7 @@ void UL_BKIN_IRQHandler(void)
     UL_ChargeSwitch(0);
 
     fault_flags |= FAULT_OVERCURRENT;
+    _diag_push(DIAG_F_OVERCURRENT_HW);
     drv_state = DRV_STATE_FAULT;
 }
 
@@ -316,7 +355,7 @@ void UL_ADC_InjectInit(void)
     sInjConfig.InjectedSamplingTime = ADC_SAMPLETIME_15CYCLES;
     sInjConfig.InjectedOffset       = 0;
     rc = HAL_ADCEx_InjectedConfigChannel(&hadc1, &sInjConfig);
-    if (rc != HAL_OK) { UL_Fault_Set(FAULT_PRECHARGE); return; }
+    if (rc != HAL_OK) { UL_Fault_Set(FAULT_PRECHARGE, DIAG_F_ADC_INIT); return; }
 
     sInjConfig.InjectedNbrOfConversion = 2;
     sInjConfig.InjectedChannel      = ADC_CHANNEL_7;
@@ -324,18 +363,18 @@ void UL_ADC_InjectInit(void)
     sInjConfig.InjectedSamplingTime = ADC_SAMPLETIME_15CYCLES;
     sInjConfig.InjectedOffset       = 0;
     rc = HAL_ADCEx_InjectedConfigChannel(&hadc3, &sInjConfig);
-    if (rc != HAL_OK) { UL_Fault_Set(FAULT_PRECHARGE); return; }
+    if (rc != HAL_OK) { UL_Fault_Set(FAULT_PRECHARGE, DIAG_F_ADC_INIT); return; }
 
     sInjConfig.InjectedChannel      = ADC_CHANNEL_6;
     sInjConfig.InjectedRank         = ADC_INJECTED_RANK_2;
     rc = HAL_ADCEx_InjectedConfigChannel(&hadc3, &sInjConfig);
-    if (rc != HAL_OK) { UL_Fault_Set(FAULT_PRECHARGE); return; }
+    if (rc != HAL_OK) { UL_Fault_Set(FAULT_PRECHARGE, DIAG_F_ADC_INIT); return; }
 
     rc = HAL_ADCEx_InjectedStart(&hadc1);
-    if (rc != HAL_OK) { UL_Fault_Set(FAULT_PRECHARGE); return; }
+    if (rc != HAL_OK) { UL_Fault_Set(FAULT_PRECHARGE, DIAG_F_ADC_INIT); return; }
 
     rc = HAL_ADCEx_InjectedStart(&hadc3);
-    if (rc != HAL_OK) { UL_Fault_Set(FAULT_PRECHARGE); return; }
+    if (rc != HAL_OK) { UL_Fault_Set(FAULT_PRECHARGE, DIAG_F_ADC_INIT); return; }
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -470,7 +509,7 @@ void UL_SVPWM_Enable(void)
     if (UL_Fault_IsTripped()) return;
 
     if (_cur_trip_stuck()) {
-        UL_Fault_Set(FAULT_OVERCURRENT);
+        UL_Fault_Set(FAULT_OVERCURRENT, DIAG_F_OVERCURRENT_SW);
         return;
     }
 
@@ -538,7 +577,7 @@ void UL_SVPWM_ISR(void)
         static uint8_t ov_trip_count = 0;
         if (isr_meas.v_bus > VBUS_OV_TRIP_V) {
             if (++ov_trip_count >= 3) {
-                UL_Fault_Set(FAULT_OVERVOLTAGE);
+                UL_Fault_Set(FAULT_OVERVOLTAGE, DIAG_F_OVERVOLTAGE);
                 return;
             }
         } else {
@@ -745,6 +784,7 @@ void UL_Charge_Tick(void)
             UL_ChargeSwitch(0);
             chg_fault = CHG_FAULT_OVERVOLTAGE;
             chg_state = CHG_STATE_FAULT;
+            UL_Fault_Set(FAULT_OVERVOLTAGE, DIAG_F_PRECHG_OV);
             return;
         }
     }
@@ -891,23 +931,31 @@ void UL_Drive_Tick(void)
         if (UL_Charge_GetState() == CHG_STATE_RUNNING) {
             drv_state = DRV_STATE_READY;
         } else if (UL_Charge_GetState() == CHG_STATE_FAULT) {
-            UL_Fault_Set(FAULT_PRECHARGE);
+            uint8_t pchg_diag;
+            switch (UL_Charge_GetFault()) {
+            case CHG_FAULT_TIMEOUT:      pchg_diag = DIAG_F_PRECHG_TIMEOUT;  break;
+            case CHG_FAULT_BUS_COLLAPSE: pchg_diag = DIAG_F_PRECHG_COLLAPSE; break;
+            case CHG_FAULT_NO_CHARGE:    pchg_diag = DIAG_F_NO_CHARGE;       break;
+            case CHG_FAULT_OVERVOLTAGE:  pchg_diag = DIAG_F_PRECHG_OV;       break;
+            default:                     pchg_diag = DIAG_F_PRECHG_TIMEOUT;  break;
+            }
+            UL_Fault_Set(FAULT_PRECHARGE, pchg_diag);
             drv_state = DRV_STATE_FAULT;
         }
         break;
 
     case DRV_STATE_READY:
         if (isr_meas.v_bus < VBUS_UV_TRIP_V) {
-            UL_Fault_Set(FAULT_BUS_COLLAPSE);
+            UL_Fault_Set(FAULT_BUS_COLLAPSE, DIAG_F_BUS_COLLAPSE);
         }
         break;
 
     case DRV_STATE_RUN:
         if (isr_meas.v_bus < VBUS_UV_TRIP_V) {
-            UL_Fault_Set(FAULT_UNDERVOLTAGE);
+            UL_Fault_Set(FAULT_UNDERVOLTAGE, DIAG_F_UNDERVOLTAGE);
         }
         if (_cur_trip_stuck()) {
-            UL_Fault_Set(FAULT_OVERCURRENT);
+            UL_Fault_Set(FAULT_OVERCURRENT, DIAG_F_OVERCURRENT_SW);
         }
         break;
 

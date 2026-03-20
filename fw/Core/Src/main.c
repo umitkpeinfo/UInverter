@@ -565,32 +565,34 @@ static void MX_GPIO_Init(void)
 
 /**
  * Format the front-panel display string based on drive state.
- * Returns a 6-char string for the 14-segment display.
+ * Returns a 6-char string for the 14-segment display module.
+ * In RUN state, shows live bus voltage for operator visibility.
  */
 static const char *_format_display(void)
 {
     static char buf[8];
-    DrvState_t ds = UL_Drive_GetState();
-    uint16_t   ff = UL_Fault_Get();
+    uint16_t ff = UL_Fault_Get();
 
     if (ff != FAULT_NONE) {
-        snprintf(buf, sizeof(buf), "F %04X", (unsigned)ff);
+        uint8_t dc = UL_Diag_GetCode();
+        if (dc != DIAG_NONE)
+            snprintf(buf, sizeof(buf), "F- %02u", dc);
+        else
+            snprintf(buf, sizeof(buf), "F %04X", (unsigned)ff);
         return buf;
     }
 
-    switch (ds) {
+    switch (UL_Drive_GetState()) {
     case DRV_STATE_IDLE:      return " IDLE ";
     case DRV_STATE_PRECHARGE: return " PRCHG";
     case DRV_STATE_READY:     return " READY";
-    case DRV_STATE_RUN: {
-        const UL_Meas_t *m = UL_Meas_Get();
-        snprintf(buf, sizeof(buf), "%5.0f", (double)m->v_bus);
+    case DRV_STATE_RUN:
+        snprintf(buf, sizeof(buf), "%5.0f", (double)UL_Meas_Get()->v_bus);
         return buf;
-    }
     case DRV_STATE_STOPPING:  return " STOP ";
     case DRV_STATE_FAULT:     return "FAULT ";
+    default:                  return "------";
     }
-    return "------";
 }
 
 /* USER CODE END 4 */
@@ -618,32 +620,35 @@ void StartTask01(void const * argument)
   UL_ADC_InjectInit();
   UL_SVPWM_Init();
 
+  static const char * const drv_names[] = {
+      "IDLE", "PRCHG", "READY", "RUN", "STOP", "FAULT"
+  };
+
   for(;;)
   {
-    static const char * const drv_names[] = {
-        "IDLE", "PRCHG", "READY", "RUN", "STOP", "FAULT"
-    };
     DrvState_t ds = UL_Drive_GetState();
     if ((int)ds < 0 || (int)ds > 5) ds = DRV_STATE_FAULT;
-    uint16_t   ff = UL_Fault_Get();
-    const UL_Meas_t *m = UL_Meas_Get();
-
-    static char dbg[208];
-    unsigned cur_trip = !HAL_GPIO_ReadPin(BRK_CUR_CPU_GPIO_Port, BRK_CUR_CPU_Pin);
+    uint16_t       ff   = UL_Fault_Get();
+    const UL_Meas_t *m  = UL_Meas_Get();
+    uint32_t       bdtr = UL_SVPWM_ReadBDTR();
+    unsigned    cur_trip = !HAL_GPIO_ReadPin(BRK_CUR_CPU_GPIO_Port,
+                                            BRK_CUR_CPU_Pin);
+    uint8_t          dc  = UL_Diag_GetCode();
+    static char dbg[224];
     int n = snprintf(dbg, sizeof(dbg),
-                     "$DRV,S:%s,F:%04X,V:%.1f,IU:%.2f,IW:%.2f,S1:%u,S3:%u,BDTR:%08lX,MOE:%u,CT:%u\r\n",
+                     "$DRV,S:%s,F:%04X,V:%.1f,IU:%.2f,IW:%.2f,"
+                     "S1:%u,S3:%u,BDTR:%08lX,MOE:%u,CT:%u,DC:%u\r\n",
                      drv_names[(int)ds],
                      (unsigned)ff,
-                     (double)m->v_bus,
-                     (double)m->i_u,
-                     (double)m->i_w,
-                     (unsigned)m->shunt1_raw,
-                     (unsigned)m->shunt3_raw,
-                     (unsigned long)UL_SVPWM_ReadBDTR(),
-                     (unsigned)(UL_SVPWM_ReadBDTR() >> 15) & 1U,
-                     cur_trip);
-    CDC_Transmit_FS((uint8_t *)dbg, (uint16_t)n);
-    osDelay(1000);
+                     (double)m->v_bus, (double)m->i_u, (double)m->i_w,
+                     (unsigned)m->shunt1_raw, (unsigned)m->shunt3_raw,
+                     (unsigned long)bdtr,
+                     (unsigned)((bdtr >> 15) & 1U),
+                     cur_trip,
+                     (unsigned)dc);
+    if (n > 0 && (size_t)n < sizeof(dbg))
+        CDC_Transmit_FS((uint8_t *)dbg, (uint16_t)n);
+    osDelay(DRV_TELEMETRY_MS);
   }
   /* USER CODE END 5 */
 }

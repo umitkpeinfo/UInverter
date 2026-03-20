@@ -5,7 +5,7 @@ PE Operator Software — SVPWM Monitor
 Company : PE Info
 Author  : Umit Kayacik
 Date    : 2026
-Version : 4.0.0
+Version : 5.0.0
 
 USB CDC serial monitor for 6-channel SVPWM inverter (UltraLogic R1).
 
@@ -13,16 +13,18 @@ Firmware command set:
   SET:FREQ:<hz>              output frequency 1-400 Hz
   SET:SWF:<hz>               switching frequency 1000-16000 Hz
   SET:MOD:<0-1155>           modulation index per-mille
-  SET:SVPWM:0                disable PWM outputs
-  SET:CHG:STOP|CLEAR         stop precharge / clear charge fault
+  SET:SVPWM:0                emergency stop (disable PWM, open relay, stop drive)
+  SET:CHG:STOP|CLEAR         stop drive / full drive reset
   SET:DRV:START|RUN|STOP|RESET   drive state machine
   SET:DISP:<text>            send text to front-panel display
   GET:REG                    read TIM1 registers
-  GET:DRV                    read drive state + measurements
+  GET:DRV                    read drive state + measurements + diag code
   GET:BTN                    read front-panel button state
+  GET:DIAG                   read diagnostic code + fault history
 
 Firmware telemetry (periodic, no request needed):
-  $DRV,S:<state>,F:<hex>,V:<volts>,IU:<amps>,IW:<amps>,S1:<raw>,S3:<raw>,BDTR:<hex>,MOE:<0|1>,CT:<0|1>
+  $DRV,S:<state>,F:<hex>,V:<volts>,IU:<amps>,IW:<amps>,
+       S1:<raw>,S3:<raw>,BDTR:<hex>,MOE:<0|1>,CT:<0|1>,DC:<code>
   $VBUS,RAW:<raw>,V:<volts>
 
 Dependencies: pip install PySide6 pyserial
@@ -31,7 +33,9 @@ Copyright (c) 2026 PE Info.  All rights reserved.
 """
 
 from __future__ import annotations
+
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -43,10 +47,11 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QThread, Signal, QRect
 from PySide6.QtGui import (
     QFont, QColor, QPainter, QPen, QBrush, QPixmap, QIcon,
-    QRadialGradient,
+    QRadialGradient, QKeySequence, QShortcut, QTextCharFormat,
 )
 import serial
 import serial.tools.list_ports
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Theme
@@ -64,9 +69,9 @@ BG_HOVER       = "#3E5068"
 FG_PRIMARY     = "#E6EDF3"
 FG_DIM         = "#6B7785"
 
-ACCENT_GREEN_L = "#3FB950"
-ACCENT_RED_L   = "#F85149"
-ACCENT_YELLOW_L= "#E3B341"
+ACCENT_GREEN   = "#3FB950"
+ACCENT_RED     = "#F85149"
+ACCENT_YELLOW  = "#E3B341"
 ACCENT_CYAN    = "#39D2C0"
 BORDER_COLOR   = "#445060"
 BORDER_FOCUS   = "#58A6FF"
@@ -74,12 +79,51 @@ BORDER_FOCUS   = "#58A6FF"
 MONO = "font-family: 'Consolas', monospace;"
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  App Constants
+#  Constants
 # ═══════════════════════════════════════════════════════════════════════════
 
 APP_NAME    = "SVPWM Monitor"
-APP_VERSION = "4.0.0"
+APP_VERSION = "5.0.0"
 APP_ORG     = "PE Info"
+
+VBUS_OV_WARN_V  = 380.0
+VBUS_CHARGED_V  = 50.0
+
+OUT_FREQ_MIN, OUT_FREQ_MAX, OUT_FREQ_DEF, OUT_FREQ_STEP = 1, 400, 60, 5
+SW_FREQ_MIN, SW_FREQ_MAX, SW_FREQ_DEF, SW_FREQ_STEP     = 1000, 16000, 5000, 500
+MOD_IDX_MIN, MOD_IDX_MAX, MOD_IDX_DEF, MOD_IDX_STEP     = 0, 1155, 850, 10
+
+FAULT_NAMES = {
+    0x0001: "OVERCURRENT",
+    0x0002: "OVERVOLTAGE",
+    0x0004: "UNDERVOLTAGE",
+    0x0008: "BUS COLLAPSE",
+    0x0010: "PRECHARGE",
+}
+
+DIAG_CODES: dict[int, tuple[str, str]] = {
+    0:  ("---",       "No fault"),
+    1:  ("F-01 OC/HW", "Overcurrent — BKIN hardware trip on PE15"),
+    2:  ("F-02 OC/SW", "Overcurrent — CUR_TRIP stuck LOW on PD10"),
+    3:  ("F-03 OV",    "Overvoltage — bus exceeded 420 V (3 readings)"),
+    4:  ("F-04 UV",    "Undervoltage — bus below 30 V during RUN"),
+    5:  ("F-05 BUS",   "Bus collapse — bus below 30 V during READY"),
+    6:  ("F-06 PCHG",  "Precharge timeout — sequence exceeded 5 s"),
+    7:  ("F-07 PCOL",  "Precharge collapse — bus dropped after relay close"),
+    8:  ("F-08 NCHG",  "No charge — no voltage rise during precharge"),
+    9:  ("F-09 ADC",   "ADC init failure — injected channel setup failed"),
+    10: ("F-10 POV",   "Precharge overvoltage — bus exceeded limit"),
+    50: ("d-50 REGN",  "Regen active — brake chopper engaged"),
+}
+
+_DRV_STATE_STYLE = {
+    "IDLE":  (FG_DIM,       "IDLE"),
+    "PRCHG": (ACCENT_YELLOW, "PRE-CHARGE"),
+    "READY": (ACCENT_CYAN,   "READY"),
+    "RUN":   (ACCENT_GREEN,  "RUNNING"),
+    "STOP":  (ACCENT_YELLOW, "STOPPING"),
+    "FAULT": (ACCENT_RED,    "FAULT"),
+}
 
 GLOBAL_STYLE = f"""
 QMainWindow, QWidget {{
@@ -120,7 +164,7 @@ QSpinBox::up-button, QSpinBox::down-button {{
 QTextEdit {{
     background-color: {BG_INPUT}; color: {FG_DIM};
     border: 1px solid {BORDER_COLOR}; border-radius: 6px;
-    padding: 8px; {MONO} font-size: 11pt;
+    padding: 8px; {MONO} font-size: 10pt;
 }}
 QGroupBox {{
     background-color: {BG_SECONDARY}; color: {FG_PRIMARY};
@@ -144,6 +188,7 @@ QStatusBar {{
 _LOGO_FILE = Path(__file__).parent / "PE_logo_MHI_Microsite1-002.png"
 _logo_cache: Optional[QPixmap] = None
 
+
 def _load_logo() -> Optional[QPixmap]:
     global _logo_cache
     if _logo_cache is not None:
@@ -154,6 +199,7 @@ def _load_logo() -> Optional[QPixmap]:
             _logo_cache = pm
             return pm
     return None
+
 
 def _make_logo(size: int = 128) -> QPixmap:
     src = _load_logo()
@@ -176,6 +222,7 @@ def _make_logo(size: int = 128) -> QPixmap:
     p.end()
     return px
 
+
 def _app_icon() -> QIcon:
     icon = QIcon()
     src = _load_logo()
@@ -183,6 +230,39 @@ def _app_icon() -> QIcon:
         pm = src.scaledToHeight(sz, Qt.SmoothTransformation) if src else _make_logo(sz)
         icon.addPixmap(pm)
     return icon
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _parse_kv(payload: str) -> dict[str, str]:
+    """Parse 'K:V,K:V,...' telemetry into a dict."""
+    result: dict[str, str] = {}
+    for pair in payload.split(","):
+        if ":" in pair:
+            k, v = pair.split(":", 1)
+            result[k] = v
+    return result
+
+
+def _decode_faults(fault_val: int) -> str:
+    """Return comma-separated fault names for a fault bitmask."""
+    if fault_val == 0:
+        return ""
+    names = [name for bit, name in FAULT_NAMES.items() if fault_val & bit]
+    if not names:
+        return f"0x{fault_val:04X}"
+    return ", ".join(names)
+
+
+def _vbus_color(volts: float) -> str:
+    if volts > VBUS_OV_WARN_V:
+        return ACCENT_RED
+    if volts > VBUS_CHARGED_V:
+        return ACCENT_GREEN
+    return FG_DIM
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Serial Worker
@@ -242,6 +322,7 @@ class SerialWorker(QThread):
         self._running = False
         self.wait(2000)
 
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  Widgets
 # ═══════════════════════════════════════════════════════════════════════════
@@ -266,19 +347,10 @@ class StatusDot(QWidget):
         p.drawEllipse(1, 1, self._sz - 2, self._sz - 2)
         p.end()
 
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  Main Window
 # ═══════════════════════════════════════════════════════════════════════════
-
-_DRV_STATE_STYLE = {
-    "IDLE":  (FG_DIM,          "IDLE"),
-    "PRCHG": (ACCENT_YELLOW_L, "PRE-CHARGE"),
-    "READY": (ACCENT_CYAN,     "READY"),
-    "RUN":   (ACCENT_GREEN_L,  "RUNNING"),
-    "STOP":  (ACCENT_YELLOW_L, "STOPPING"),
-    "FAULT": (ACCENT_RED_L,    "FAULT"),
-}
-
 
 class MainWindow(QMainWindow):
 
@@ -286,14 +358,26 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(f"{APP_NAME}  —  UltraLogic R1")
         self.setWindowIcon(_app_icon())
-        self.setMinimumSize(800, 520)
-        self.resize(1050, 620)
+        self.setMinimumSize(880, 560)
+        self.resize(1100, 660)
 
         self._worker: Optional[SerialWorker] = None
 
         self._build_toolbar()
         self._build_central()
         self._build_statusbar()
+        self._bind_shortcuts()
+
+    # ── Keyboard Shortcuts ────────────────────────────────────────────
+
+    def _bind_shortcuts(self) -> None:
+        esc = QShortcut(QKeySequence(Qt.Key_Escape), self)
+        esc.activated.connect(self._emergency_stop)
+
+    def _emergency_stop(self) -> None:
+        if self._worker:
+            self._worker.send_command("SET:SVPWM:0")
+            self.statusBar().showMessage("  EMERGENCY STOP sent (Esc)", 5000)
 
     # ── Toolbar ──────────────────────────────────────────────────────
 
@@ -367,9 +451,9 @@ class MainWindow(QMainWindow):
         w.start()
         self._worker = w
 
-        self._conn_dot.set_color(ACCENT_GREEN_L)
+        self._conn_dot.set_color(ACCENT_GREEN)
         self._conn_label.setText(f"  Connected: {port}")
-        self._conn_label.setStyleSheet(f"color: {ACCENT_GREEN_L}; font-size: 11pt;")
+        self._conn_label.setStyleSheet(f"color: {ACCENT_GREEN}; font-size: 11pt;")
         self._connect_btn.setText("Disconnect")
         self.statusBar().showMessage(f"  Connected to {port}", 3000)
 
@@ -386,9 +470,7 @@ class MainWindow(QMainWindow):
     # ── Serial Data Handling ─────────────────────────────────────────
 
     def _on_line(self, line: str) -> None:
-        self._log.append(line)
-        sb = self._log.verticalScrollBar()
-        sb.setValue(sb.maximum())
+        self._log_line(line)
 
         if line.startswith("$VBUS,"):
             self._parse_vbus(line)
@@ -396,30 +478,21 @@ class MainWindow(QMainWindow):
             self._parse_drv(line)
         elif line.startswith("$BTN,"):
             self._parse_btn(line)
+        elif line.startswith("$DIAG,"):
+            self._parse_diag(line)
 
     def _parse_vbus(self, line: str) -> None:
         try:
-            parts = {k: v for k, v in
-                     (p.split(":") for p in line[6:].split(",") if ":" in p)}
+            parts = _parse_kv(line[6:])
             raw = int(parts.get("RAW", "0"))
             volts = float(parts.get("V", "0"))
         except (ValueError, KeyError):
             return
-        self._vbus_value.setText(f"{volts:.0f}")
-        self._vbus_raw.setText(f"RAW {raw}")
-        if volts > 380:
-            color = ACCENT_RED_L
-        elif volts > 50:
-            color = ACCENT_GREEN_L
-        else:
-            color = FG_DIM
-        self._vbus_value.setStyleSheet(
-            f"color: {color}; font-size: 22pt; font-weight: bold; {MONO}")
+        self._update_vbus_display(volts, raw)
 
     def _parse_drv(self, line: str) -> None:
         try:
-            parts = {k: v for k, v in
-                     (p.split(":", 1) for p in line[5:].split(",") if ":" in p)}
+            parts = _parse_kv(line[5:])
             state = parts.get("S", "IDLE")
             fault_hex = parts.get("F", "0000")
             volts = float(parts.get("V", "0"))
@@ -427,37 +500,56 @@ class MainWindow(QMainWindow):
             i_w = float(parts.get("IW", "0"))
             moe = parts.get("MOE", "")
             cur_trip = parts.get("CT", "0")
+            diag_code = int(parts.get("DC", "0"))
             fault_val = int(fault_hex, 16) if fault_hex else 0
         except (ValueError, KeyError):
             return
 
         color, label = _DRV_STATE_STYLE.get(state, (FG_DIM, state))
         if fault_val != 0:
-            label = f"FAULT: 0x{fault_hex}"
-            color = ACCENT_RED_L
+            label = f"FAULT: {_decode_faults(fault_val)}"
+            color = ACCENT_RED
         self._drv_state_lbl.setText(label)
         self._drv_state_lbl.setStyleSheet(
             f"color: {color}; font-size: 12pt; font-weight: bold; {MONO}")
 
-        moe_txt = "ON" if moe == "1" else "OFF"
-        moe_color = ACCENT_GREEN_L if moe == "1" else FG_DIM
-        self._moe_lbl.setText(f"MOE: {moe_txt}")
+        short, desc = DIAG_CODES.get(diag_code, (f"F-{diag_code:02d}", "Unknown"))
+        if diag_code != 0:
+            self._diag_lbl.setText(f"{short}  —  {desc}")
+            diag_color = ACCENT_RED if diag_code < 50 else ACCENT_YELLOW
+            self._diag_lbl.setStyleSheet(
+                f"color: {diag_color}; font-size: 9pt; {MONO}")
+        else:
+            self._diag_lbl.setText("")
+            self._diag_lbl.setStyleSheet("")
+
+        moe_on = moe == "1"
+        self._moe_lbl.setText(f"MOE: {'ON' if moe_on else 'OFF'}")
         self._moe_lbl.setStyleSheet(
-            f"color: {moe_color}; font-size: 10pt; font-weight: bold; {MONO}")
+            f"color: {ACCENT_GREEN if moe_on else FG_DIM};"
+            f"font-size: 10pt; font-weight: bold; {MONO}")
 
-        ct_str = " CUR_TRIP!" if cur_trip == "1" else ""
-        self._shunt_lbl.setText(f"IU:{i_u:+.1f}A  IW:{i_w:+.1f}A{ct_str}")
+        tripped = cur_trip == "1"
+        if tripped:
+            self._ct_lbl.setText("CUR_TRIP ACTIVE")
+            self._ct_lbl.setStyleSheet(
+                f"color: white; background: {ACCENT_RED};"
+                f"font-size: 9pt; font-weight: bold; {MONO}"
+                f"padding: 2px 6px; border-radius: 3px;")
+        else:
+            self._ct_lbl.setText("")
+            self._ct_lbl.setStyleSheet("")
 
-        self._vbus_value.setText(f"{volts:.0f}")
-        vbus_color = ACCENT_RED_L if volts > 380 else (
-            ACCENT_GREEN_L if volts > 50 else FG_DIM)
-        self._vbus_value.setStyleSheet(
-            f"color: {vbus_color}; font-size: 22pt; font-weight: bold; {MONO}")
+        self._shunt_lbl.setText(f"IU: {i_u:+.2f} A    IW: {i_w:+.2f} A")
+        shunt_color = ACCENT_GREEN if state == "RUN" else FG_DIM
+        self._shunt_lbl.setStyleSheet(
+            f"color: {shunt_color}; font-size: 10pt; {MONO}")
+
+        self._update_vbus_display(volts)
 
     def _parse_btn(self, line: str) -> None:
         try:
-            parts = {k: v for k, v in
-                     (p.split(":") for p in line[5:].split(",") if ":" in p)}
+            parts = _parse_kv(line[5:])
             raw = parts.get("RAW", "00")
             scr = parts.get("SCR", "0")
             inc = parts.get("INC", "0")
@@ -465,6 +557,41 @@ class MainWindow(QMainWindow):
         except (ValueError, KeyError):
             return
         self._btn_lbl.setText(f"RAW:0x{raw}  SCR:{scr}  INC:{inc}  DEC:{dec}")
+
+    def _parse_diag(self, line: str) -> None:
+        """Parse $DIAG response and display decoded fault history in the log."""
+        try:
+            parts = _parse_kv(line[6:])
+            dc = int(parts.get("DC", "0"))
+            count = int(parts.get("N", "0"))
+        except (ValueError, KeyError):
+            return
+
+        short, desc = DIAG_CODES.get(dc, (f"F-{dc:02d}", "Unknown"))
+        self._log_line(f"--- DIAGNOSTIC REPORT ---")
+        self._log_line(f"Active: {short} — {desc}")
+        self._log_line(f"History ({count} entries):")
+
+        for i in range(count):
+            key = f"H{i}"
+            val = parts.get(key, "")
+            if "@" in val:
+                code_s, tick_s = val.split("@", 1)
+                code = int(code_s)
+                tick = int(tick_s)
+                s, d = DIAG_CODES.get(code, (f"F-{code:02d}", "Unknown"))
+                secs = tick / 1000.0
+                self._log_line(f"  [{i}] {s} at {secs:.1f}s — {d}")
+
+        self._log_line(f"--- END REPORT ---")
+
+    def _update_vbus_display(self, volts: float, raw: Optional[int] = None) -> None:
+        color = _vbus_color(volts)
+        self._vbus_value.setText(f"{volts:.0f}")
+        self._vbus_value.setStyleSheet(
+            f"color: {color}; font-size: 24pt; font-weight: bold; {MONO}")
+        if raw is not None:
+            self._vbus_raw.setText(f"RAW {raw}")
 
     # ── Command Handlers ─────────────────────────────────────────────
 
@@ -503,7 +630,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("  Not connected", 3000)
             return
         self._worker.send_command(cmd)
-        self._log.append(f">>> {cmd}")
+        self._log_line(f">>> {cmd}")
         self._cmd_input.clear()
         self.statusBar().showMessage(f"  Sent: {cmd}", 3000)
 
@@ -511,7 +638,31 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"  Serial error: {msg}", 5000)
         self._disconnect()
 
-    # ── Central ──────────────────────────────────────────────────────
+    # ── Log ───────────────────────────────────────────────────────────
+
+    def _log_line(self, text: str) -> None:
+        ts = datetime.now().strftime("%H:%M:%S.") + f"{datetime.now().microsecond // 1000:03d}"
+        color = FG_DIM
+        if text.startswith("$DRV,"):
+            color = PE_BLUE_LIGHT
+        elif text.startswith("$VBUS,"):
+            color = ACCENT_CYAN
+        elif text.startswith("$BTN,"):
+            color = ACCENT_YELLOW
+        elif text.startswith("---") or text.startswith("  ["):
+            color = ACCENT_RED
+        elif text.startswith("Active:") or text.startswith("History"):
+            color = ACCENT_YELLOW
+        elif text.startswith(">>>"):
+            color = ACCENT_GREEN
+
+        self._log.append(
+            f'<span style="color:{FG_DIM}">{ts}</span>  '
+            f'<span style="color:{color}">{text}</span>')
+        sb = self._log.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    # ── Central Widget ───────────────────────────────────────────────
 
     def _build_central(self) -> None:
         central = QWidget()
@@ -520,7 +671,9 @@ class MainWindow(QMainWindow):
         lo.setContentsMargins(12, 8, 12, 8)
         lo.setSpacing(10)
 
-        header = QLabel("  SVPWM  ·  3 Complementary Pairs  ·  TIM1  ·  PE8-PE13")
+        header = QLabel(
+            "  SVPWM  ·  3 Complementary Pairs  ·  TIM1  ·  PE8-PE13"
+            "    |    Esc = Emergency Stop")
         header.setStyleSheet(
             f"background: {BG_SECONDARY}; color: {PE_BLUE_LIGHT};"
             f"font-size: 11pt; font-weight: bold; padding: 8px 12px;"
@@ -530,8 +683,16 @@ class MainWindow(QMainWindow):
 
         panels = QHBoxLayout()
         panels.setSpacing(10)
+        panels.addLayout(self._build_drive_panel(), 3)
+        panels.addLayout(self._build_param_panel(), 3)
+        panels.addLayout(self._build_aux_panel(), 2)
+        lo.addLayout(panels)
 
-        # ── Left: Drive Control + DC Bus ─────────────────────────────
+        self._build_log_panel(lo)
+
+    # ── Left Panel: Drive Control + DC Bus ────────────────────────────
+
+    def _build_drive_panel(self) -> QVBoxLayout:
         left = QVBoxLayout()
         left.setSpacing(10)
 
@@ -545,65 +706,61 @@ class MainWindow(QMainWindow):
         self._drv_state_lbl.setAlignment(Qt.AlignCenter)
         drv_lo.addWidget(self._drv_state_lbl)
 
+        status_row = QHBoxLayout()
+        status_row.setSpacing(8)
         self._moe_lbl = QLabel("MOE: OFF")
         self._moe_lbl.setStyleSheet(
             f"color: {FG_DIM}; font-size: 10pt; font-weight: bold; {MONO}")
         self._moe_lbl.setAlignment(Qt.AlignCenter)
-        drv_lo.addWidget(self._moe_lbl)
+        status_row.addWidget(self._moe_lbl)
+        self._ct_lbl = QLabel("")
+        self._ct_lbl.setAlignment(Qt.AlignCenter)
+        status_row.addWidget(self._ct_lbl)
+        drv_lo.addLayout(status_row)
 
-        self._shunt_lbl = QLabel("IU:---  IW:---")
-        self._shunt_lbl.setStyleSheet(
-            f"color: {FG_DIM}; font-size: 9pt; {MONO}")
+        self._shunt_lbl = QLabel("IU: ---    IW: ---")
+        self._shunt_lbl.setStyleSheet(f"color: {FG_DIM}; font-size: 10pt; {MONO}")
         self._shunt_lbl.setAlignment(Qt.AlignCenter)
         drv_lo.addWidget(self._shunt_lbl)
+
+        self._diag_lbl = QLabel("")
+        self._diag_lbl.setAlignment(Qt.AlignCenter)
+        self._diag_lbl.setWordWrap(True)
+        drv_lo.addWidget(self._diag_lbl)
 
         drv_btns = QGridLayout()
         drv_btns.setSpacing(6)
 
-        btn_start = QPushButton("Start")
-        btn_start.setCursor(Qt.PointingHandCursor)
-        btn_start.setStyleSheet(
-            f"font-size: 10pt; padding: 6px; color: {ACCENT_GREEN_L}; {MONO}")
-        btn_start.setToolTip("SET:DRV:START — begins precharge sequence")
-        btn_start.clicked.connect(lambda: self._send_cmd("SET:DRV:START"))
-        drv_btns.addWidget(btn_start, 0, 0)
-
-        btn_run = QPushButton("Run")
-        btn_run.setCursor(Qt.PointingHandCursor)
-        btn_run.setStyleSheet(
-            f"font-size: 10pt; padding: 6px; color: {ACCENT_GREEN_L};"
-            f"font-weight: bold; {MONO}")
-        btn_run.setToolTip("SET:DRV:RUN — enable SVPWM outputs (after precharge)")
-        btn_run.clicked.connect(lambda: self._send_cmd("SET:DRV:RUN"))
-        drv_btns.addWidget(btn_run, 0, 1)
-
-        btn_stop = QPushButton("Stop")
-        btn_stop.setCursor(Qt.PointingHandCursor)
-        btn_stop.setStyleSheet(
-            f"font-size: 10pt; padding: 6px; color: {ACCENT_RED_L};"
-            f"font-weight: bold; {MONO}")
-        btn_stop.setToolTip("SET:DRV:STOP — disable outputs, open relay")
-        btn_stop.clicked.connect(lambda: self._send_cmd("SET:DRV:STOP"))
-        drv_btns.addWidget(btn_stop, 1, 0)
-
-        btn_reset = QPushButton("Reset")
-        btn_reset.setCursor(Qt.PointingHandCursor)
-        btn_reset.setStyleSheet(
-            f"font-size: 10pt; padding: 6px; color: {ACCENT_YELLOW_L}; {MONO}")
-        btn_reset.setToolTip("SET:DRV:RESET — clear faults, return to IDLE")
-        btn_reset.clicked.connect(lambda: self._send_cmd("SET:DRV:RESET"))
-        drv_btns.addWidget(btn_reset, 1, 1)
+        btn_data = [
+            ("Start", ACCENT_GREEN, False,
+             "SET:DRV:START — begin precharge sequence", "SET:DRV:START", 0, 0),
+            ("Run", ACCENT_GREEN, True,
+             "SET:DRV:RUN — enable SVPWM outputs", "SET:DRV:RUN", 0, 1),
+            ("Stop", ACCENT_RED, True,
+             "SET:DRV:STOP — disable outputs, open relay", "SET:DRV:STOP", 1, 0),
+            ("Reset", ACCENT_YELLOW, False,
+             "SET:DRV:RESET — clear faults, return to IDLE", "SET:DRV:RESET", 1, 1),
+        ]
+        for label, color, bold, tooltip, cmd, row, col in btn_data:
+            btn = QPushButton(label)
+            btn.setCursor(Qt.PointingHandCursor)
+            weight = "font-weight: bold;" if bold else ""
+            btn.setStyleSheet(
+                f"font-size: 10pt; padding: 6px; color: {color}; {weight} {MONO}")
+            btn.setToolTip(tooltip)
+            btn.clicked.connect(lambda _, c=cmd: self._send_cmd(c))
+            drv_btns.addWidget(btn, row, col)
 
         drv_lo.addLayout(drv_btns)
 
-        e_stop = QPushButton("EMERGENCY STOP")
+        e_stop = QPushButton("EMERGENCY STOP  (Esc)")
         e_stop.setCursor(Qt.PointingHandCursor)
         e_stop.setStyleSheet(
-            f"font-size: 11pt; padding: 8px; color: white;"
-            f"background: {ACCENT_RED_L}; font-weight: bold;"
+            f"font-size: 11pt; padding: 10px; color: white;"
+            f"background: {ACCENT_RED}; font-weight: bold;"
             f"border: 2px solid #C03030; border-radius: 6px; {MONO}")
-        e_stop.setToolTip("SET:SVPWM:0 — immediately disable PWM outputs")
-        e_stop.clicked.connect(lambda: self._send_cmd("SET:SVPWM:0"))
+        e_stop.setToolTip("SET:SVPWM:0 — emergency stop: disable PWM, open relay, stop drive")
+        e_stop.clicked.connect(self._emergency_stop)
         drv_lo.addWidget(e_stop)
 
         left.addWidget(drv_group)
@@ -616,10 +773,10 @@ class MainWindow(QMainWindow):
         vbus_row.setSpacing(4)
         self._vbus_value = QLabel("---")
         self._vbus_value.setStyleSheet(
-            f"color: {FG_DIM}; font-size: 22pt; font-weight: bold; {MONO}")
+            f"color: {FG_DIM}; font-size: 24pt; font-weight: bold; {MONO}")
         vbus_row.addWidget(self._vbus_value)
-        vbus_unit = QLabel("V")
-        vbus_unit.setStyleSheet(f"color: {FG_DIM}; font-size: 12pt; {MONO}")
+        vbus_unit = QLabel("V dc")
+        vbus_unit.setStyleSheet(f"color: {FG_DIM}; font-size: 11pt; {MONO}")
         vbus_unit.setAlignment(Qt.AlignBottom)
         vbus_row.addWidget(vbus_unit)
         vbus_row.addStretch()
@@ -631,29 +788,33 @@ class MainWindow(QMainWindow):
 
         chg_btns = QHBoxLayout()
         chg_btns.setSpacing(4)
-        btn_chg_stop = QPushButton("Chg Stop")
+
+        btn_chg_stop = QPushButton("Drive Stop")
         btn_chg_stop.setFixedHeight(28)
         btn_chg_stop.setCursor(Qt.PointingHandCursor)
         btn_chg_stop.setStyleSheet(f"font-size: 9pt; padding: 2px 6px; {MONO}")
-        btn_chg_stop.setToolTip("SET:CHG:STOP — stop precharge, open relay")
+        btn_chg_stop.setToolTip("SET:CHG:STOP — stop drive, disable PWM, open relay")
         btn_chg_stop.clicked.connect(lambda: self._send_cmd("SET:CHG:STOP"))
         chg_btns.addWidget(btn_chg_stop)
 
-        btn_chg_clear = QPushButton("Clear Fault")
+        btn_chg_clear = QPushButton("Clear Faults")
         btn_chg_clear.setFixedHeight(28)
         btn_chg_clear.setCursor(Qt.PointingHandCursor)
         btn_chg_clear.setStyleSheet(
-            f"font-size: 9pt; padding: 2px 6px; color: {ACCENT_YELLOW_L}; {MONO}")
-        btn_chg_clear.setToolTip("SET:CHG:CLEAR — clear charge fault")
+            f"font-size: 9pt; padding: 2px 6px; color: {ACCENT_YELLOW}; {MONO}")
+        btn_chg_clear.setToolTip(
+            "SET:CHG:CLEAR — full reset: clear faults, stop drive, return to IDLE")
         btn_chg_clear.clicked.connect(lambda: self._send_cmd("SET:CHG:CLEAR"))
         chg_btns.addWidget(btn_chg_clear)
         bus_lo.addLayout(chg_btns)
 
         left.addWidget(bus_group)
         left.addStretch()
-        panels.addLayout(left)
+        return left
 
-        # ── Center: Parameters ───────────────────────────────────────
+    # ── Center Panel: Parameters + Pin Map ────────────────────────────
+
+    def _build_param_panel(self) -> QVBoxLayout:
         center = QVBoxLayout()
         center.setSpacing(10)
 
@@ -661,33 +822,15 @@ class MainWindow(QMainWindow):
         param_lo = QVBoxLayout(param_group)
         param_lo.setSpacing(8)
 
-        def _make_param(label: str, unit: str, color: str,
-                        lo_val: int, hi_val: int, default: int,
-                        step: int = 1) -> QSpinBox:
-            row = QHBoxLayout()
-            row.setSpacing(6)
-            lbl = QLabel(label)
-            lbl.setStyleSheet(
-                f"color: {FG_DIM}; font-size: 9pt; font-weight: bold; {MONO}")
-            lbl.setFixedWidth(80)
-            row.addWidget(lbl)
-            sb = QSpinBox()
-            sb.setRange(lo_val, hi_val)
-            sb.setValue(default)
-            sb.setSingleStep(step)
-            sb.setSuffix(f"  {unit}")
-            sb.setStyleSheet(
-                sb.styleSheet() + f"QSpinBox {{ color: {color}; }}")
-            row.addWidget(sb)
-            param_lo.addLayout(row)
-            return sb
-
-        self._spin_freq = _make_param(
-            "OUT FREQ", "Hz", ACCENT_GREEN_L, 1, 400, 60, 5)
-        self._spin_swf = _make_param(
-            "SW FREQ", "Hz", PE_BLUE_LIGHT, 1000, 16000, 5000, 500)
-        self._spin_mod = _make_param(
-            "MOD IDX", "\u2030", ACCENT_YELLOW_L, 0, 1155, 850, 10)
+        self._spin_freq = self._make_param_row(
+            param_lo, "OUT FREQ", "Hz", ACCENT_GREEN,
+            OUT_FREQ_MIN, OUT_FREQ_MAX, OUT_FREQ_DEF, OUT_FREQ_STEP)
+        self._spin_swf = self._make_param_row(
+            param_lo, "SW FREQ", "Hz", PE_BLUE_LIGHT,
+            SW_FREQ_MIN, SW_FREQ_MAX, SW_FREQ_DEF, SW_FREQ_STEP)
+        self._spin_mod = self._make_param_row(
+            param_lo, "MOD IDX", "\u2030", ACCENT_YELLOW,
+            MOD_IDX_MIN, MOD_IDX_MAX, MOD_IDX_DEF, MOD_IDX_STEP)
 
         send_btn = QPushButton("Apply")
         send_btn.setObjectName("primaryBtn")
@@ -702,8 +845,8 @@ class MainWindow(QMainWindow):
         pins_lo = QHBoxLayout(pins_group)
         pins_lo.setSpacing(12)
         pins_info = [
-            ("U  PE8/PE9",   "CH1/CH1N", ACCENT_RED_L),
-            ("V  PE10/PE11", "CH2/CH2N", ACCENT_YELLOW_L),
+            ("U  PE8/PE9",   "CH1/CH1N", ACCENT_RED),
+            ("V  PE10/PE11", "CH2/CH2N", ACCENT_YELLOW),
             ("W  PE12/PE13", "CH3/CH3N", ACCENT_CYAN),
         ]
         for title, value, color in pins_info:
@@ -721,9 +864,32 @@ class MainWindow(QMainWindow):
         center.addWidget(pins_group)
 
         center.addStretch()
-        panels.addLayout(center)
+        return center
 
-        # ── Right: Display + Buttons ─────────────────────────────────
+    @staticmethod
+    def _make_param_row(parent_lo: QVBoxLayout, label: str, unit: str,
+                        color: str, lo_val: int, hi_val: int,
+                        default: int, step: int) -> QSpinBox:
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        lbl = QLabel(label)
+        lbl.setStyleSheet(
+            f"color: {FG_DIM}; font-size: 9pt; font-weight: bold; {MONO}")
+        lbl.setFixedWidth(80)
+        row.addWidget(lbl)
+        sb = QSpinBox()
+        sb.setRange(lo_val, hi_val)
+        sb.setValue(default)
+        sb.setSingleStep(step)
+        sb.setSuffix(f"  {unit}")
+        sb.setStyleSheet(sb.styleSheet() + f"QSpinBox {{ color: {color}; }}")
+        row.addWidget(sb)
+        parent_lo.addLayout(row)
+        return sb
+
+    # ── Right Panel: Display + Registers ──────────────────────────────
+
+    def _build_aux_panel(self) -> QVBoxLayout:
         right = QVBoxLayout()
         right.setSpacing(10)
 
@@ -760,42 +926,39 @@ class MainWindow(QMainWindow):
         disp_lo.addWidget(btn_poll)
 
         self._btn_lbl = QLabel("RAW:--  SCR:--  INC:--  DEC:--")
-        self._btn_lbl.setStyleSheet(
-            f"color: {FG_DIM}; font-size: 9pt; {MONO}")
+        self._btn_lbl.setStyleSheet(f"color: {FG_DIM}; font-size: 9pt; {MONO}")
         self._btn_lbl.setAlignment(Qt.AlignCenter)
         disp_lo.addWidget(self._btn_lbl)
 
         right.addWidget(disp_group)
 
-        reg_group = QGroupBox("REGISTERS")
-        reg_lo = QVBoxLayout(reg_group)
-        reg_lo.setSpacing(4)
-        btn_get_reg = QPushButton("GET:REG")
-        btn_get_reg.setCursor(Qt.PointingHandCursor)
-        btn_get_reg.setFixedHeight(28)
-        btn_get_reg.setStyleSheet(f"font-size: 9pt; padding: 2px 6px; {MONO}")
-        btn_get_reg.clicked.connect(lambda: self._send_cmd("GET:REG"))
-        reg_lo.addWidget(btn_get_reg)
+        query_group = QGroupBox("DIAGNOSTICS")
+        query_lo = QVBoxLayout(query_group)
+        query_lo.setSpacing(4)
 
-        btn_get_drv = QPushButton("GET:DRV")
-        btn_get_drv.setCursor(Qt.PointingHandCursor)
-        btn_get_drv.setFixedHeight(28)
-        btn_get_drv.setStyleSheet(f"font-size: 9pt; padding: 2px 6px; {MONO}")
-        btn_get_drv.clicked.connect(lambda: self._send_cmd("GET:DRV"))
-        reg_lo.addWidget(btn_get_drv)
+        for label, cmd in [("GET:REG", "GET:REG"),
+                           ("GET:DRV", "GET:DRV"),
+                           ("GET:DIAG", "GET:DIAG"),
+                           ("GET:HEAP", "GET:HEAP")]:
+            btn = QPushButton(label)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFixedHeight(28)
+            btn.setStyleSheet(f"font-size: 9pt; padding: 2px 6px; {MONO}")
+            btn.clicked.connect(lambda _, c=cmd: self._send_cmd(c))
+            query_lo.addWidget(btn)
 
-        right.addWidget(reg_group)
+        right.addWidget(query_group)
         right.addStretch()
-        panels.addLayout(right)
+        return right
 
-        lo.addLayout(panels)
+    # ── Bottom: Log + Raw Command ─────────────────────────────────────
 
-        # ── Bottom: Log + Raw Command ────────────────────────────────
+    def _build_log_panel(self, parent_lo: QVBoxLayout) -> None:
         self._log = QTextEdit()
         self._log.setReadOnly(True)
         self._log.setPlaceholderText("Serial log — connect to see data")
-        self._log.document().setMaximumBlockCount(500)
-        lo.addWidget(self._log)
+        self._log.document().setMaximumBlockCount(800)
+        parent_lo.addWidget(self._log)
 
         cmd_row = QHBoxLayout()
         cmd_row.setSpacing(6)
@@ -817,10 +980,12 @@ class MainWindow(QMainWindow):
         send_raw.setFixedWidth(80)
         send_raw.clicked.connect(self._send_raw_cmd)
         cmd_row.addWidget(send_raw)
-        lo.addLayout(cmd_row)
+        parent_lo.addLayout(cmd_row)
+
+    # ── Status Bar ────────────────────────────────────────────────────
 
     def _build_statusbar(self) -> None:
-        lbl = QLabel(f"  App v{APP_VERSION}")
+        lbl = QLabel(f"  v{APP_VERSION}  ·  Esc = E-Stop")
         lbl.setStyleSheet(f"color: {FG_DIM}; font-size: 10pt;")
         self.statusBar().addPermanentWidget(lbl)
 

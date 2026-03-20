@@ -65,8 +65,46 @@ extern "C" {
 
 uint16_t UL_Fault_Get(void);
 uint8_t  UL_Fault_IsTripped(void);
-void     UL_Fault_Set(uint16_t mask);
+void     UL_Fault_Set(uint16_t mask, uint8_t diag);
 void     UL_Fault_Clear(void);
+
+/* ── Diagnostic Code System ──────────────────────────────────────────
+ *
+ *  Each fault site pushes a specific diagnostic code into a ring buffer.
+ *  Codes 1-49 are faults (require reset), 50-99 are warnings.
+ *  The display board shows "F-XX" and the PC app shows full descriptions.
+ *
+ *  History buffer stores the last DIAG_HISTORY_LEN entries with timestamps
+ *  for post-mortem analysis via GET:DIAG.
+ */
+
+#define DIAG_NONE                0U
+
+#define DIAG_F_OVERCURRENT_HW   1U   /* BKIN hardware trip on PE15           */
+#define DIAG_F_OVERCURRENT_SW   2U   /* CUR_TRIP stuck LOW on PD10          */
+#define DIAG_F_OVERVOLTAGE      3U   /* Bus > VBUS_OV_TRIP_V (3 readings)   */
+#define DIAG_F_UNDERVOLTAGE     4U   /* Bus < VBUS_UV_TRIP_V during RUN     */
+#define DIAG_F_BUS_COLLAPSE     5U   /* Bus < VBUS_UV_TRIP_V during READY   */
+#define DIAG_F_PRECHG_TIMEOUT   6U   /* Precharge sequence timed out        */
+#define DIAG_F_PRECHG_COLLAPSE  7U   /* Bus collapsed after relay close     */
+#define DIAG_F_NO_CHARGE        8U   /* No voltage rise during precharge    */
+#define DIAG_F_ADC_INIT         9U   /* ADC injected channel init failed    */
+#define DIAG_F_PRECHG_OV      10U   /* Overvoltage during precharge        */
+
+#define DIAG_W_REGEN_ACTIVE    50U   /* Brake chopper engaged               */
+
+#define DIAG_IS_FAULT(c)       ((c) >= 1U && (c) <= 49U)
+
+#define DIAG_HISTORY_LEN        8U
+
+typedef struct {
+    uint8_t  code;
+    uint32_t tick_ms;
+} DiagEntry_t;
+
+uint8_t            UL_Diag_GetCode(void);
+const DiagEntry_t *UL_Diag_GetHistory(uint8_t *count_out);
+void               UL_Diag_Clear(void);
 
 /* ── Drive State Machine ─────────────────────────────────────────────
  *
@@ -239,6 +277,7 @@ uint8_t     UL_Charge_BusReady(void);
  */
 
 #define HEARTBEAT_PERIOD_MS    50U
+#define DRV_TELEMETRY_MS       1000U   /* $DRV periodic telemetry interval */
 
 void UL_Heartbeat_Toggle(void);
 

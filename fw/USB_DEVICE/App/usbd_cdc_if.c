@@ -13,13 +13,14 @@
   *     SET:SWF:<hz>                   switching frequency (1-16 kHz)
   *     SET:MOD:<0-1155>               modulation index (per-mille)
   *     SET:SVPWM:0                    emergency stop (PWM + relay + state)
-  *     SET:CHG:STOP|CLEAR             stop drive / clear charge fault
+  *     SET:CHG:STOP|CLEAR             stop drive / full drive reset
   *     SET:DRV:START|RUN|STOP|RESET   drive state machine
   *     SET:DISP:<text>                front-panel display text
   *
   *   GET commands (FW → PC, response prefixed with $):
   *     GET:REG    → $REG,BDTR:…,CCER:…,CR1:…
-  *     GET:DRV    → $DRV,S:…,F:…,V:…,IU:…,IW:…,S1:…,S3:…,BDTR:…,MOE:…,CT:…
+  *     GET:DRV    → $DRV,S:…,F:…,V:…,…,DC:<diag_code>
+  *     GET:DIAG   → $DIAG,DC:<active>,N:<count>,H0:<code>@<tick>,…
   *     GET:BTN    → $BTN,RAW:…,SCR:…,INC:…,DEC:…
   *     GET:HEAP   → $HEAP,FREE:…,MIN:…,T01:…,T02:…,T03:…,T05:…
   *
@@ -83,6 +84,7 @@
   */
 
 /* USER CODE BEGIN PRIVATE_DEFINES */
+#define CMD_REPLY_QUEUE_DEPTH  4U
 /* USER CODE END PRIVATE_DEFINES */
 
 /**
@@ -121,6 +123,12 @@ static uint8_t LineCoding[7] = {
     0x00,                     /* no parity   */
     0x08                      /* 8 data bits */
 };
+/* Query replies need stable storage until the USB IN transfer completes. */
+static uint8_t  CmdReplyQueue[CMD_REPLY_QUEUE_DEPTH][APP_TX_DATA_SIZE];
+static uint16_t CmdReplyLen[CMD_REPLY_QUEUE_DEPTH];
+static uint8_t  CmdReplyHead = 0U;
+static uint8_t  CmdReplyTail = 0U;
+static uint8_t  CmdReplyCount = 0U;
 /* USER CODE END PRIVATE_VARIABLES */
 
 /**
@@ -154,7 +162,9 @@ static int8_t CDC_Receive_FS(uint8_t* pbuf, uint32_t *Len);
 static int8_t CDC_TransmitCplt_FS(uint8_t *pbuf, uint32_t *Len, uint8_t epnum);
 
 /* USER CODE BEGIN PRIVATE_FUNCTIONS_DECLARATION */
-
+static void _dispatch_cmd(const char *line);
+static void _queue_cmd_reply(const uint8_t *buf, uint16_t len);
+static void _kick_cmd_reply_tx(void);
 /* USER CODE END PRIVATE_FUNCTIONS_DECLARATION */
 
 /**
@@ -284,8 +294,6 @@ static int8_t CDC_Control_FS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
   * @param  Len: Number of data received (in bytes)
   * @retval Result of the operation: USBD_OK if all operations are OK else USBD_FAIL
   */
-static void _dispatch_cmd(const char *line);
-
 static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
 {
   /* USER CODE BEGIN 6 */
@@ -293,13 +301,29 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
       *Len = APP_RX_DATA_SIZE - 1;
   Buf[*Len] = '\0';
 
-  char *p = (char *)Buf;
-  char *tok;
-  while ((tok = strtok(p, "\r\n")) != NULL) {
-      p = NULL;
-      while (*tok == ' ') tok++;
-      if (*tok != '\0')
-          _dispatch_cmd(tok);
+  char *line = (char *)Buf;
+  while (*line != '\0') {
+      while (*line == '\r' || *line == '\n' || *line == ' ')
+          line++;
+      if (*line == '\0')
+          break;
+
+      char *delim = line;
+      while (*delim != '\0' && *delim != '\r' && *delim != '\n')
+          delim++;
+
+      char saved = *delim;
+      *delim = '\0';
+      char *trim = delim;
+      while (trim > line && *(trim - 1) == ' ')
+          *--trim = '\0';
+
+      if (*line != '\0')
+          _dispatch_cmd(line);
+
+      if (saved == '\0')
+          break;
+      line = delim + 1;
   }
 
   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, &Buf[0]);
@@ -346,7 +370,7 @@ static void _dispatch_cmd(const char *line)
   } else if (strncmp(line, "SET:DISP:", 9) == 0) {
       UL_Display_SendText(line + 9);
 
-  /* ── Query commands (responses use static UserTxBufferFS) ─── */
+  /* ── Query commands (responses are queued for stable TX storage) ─── */
 
   } else if (strncmp(line, "GET:REG", 7) == 0) {
       int n = snprintf((char *)UserTxBufferFS, APP_TX_DATA_SIZE,
@@ -355,7 +379,7 @@ static void _dispatch_cmd(const char *line)
                         (unsigned long)UL_SVPWM_ReadCCER(),
                         (unsigned long)UL_SVPWM_ReadCR1());
       if (n > 0 && (size_t)n < APP_TX_DATA_SIZE)
-          CDC_Transmit_FS(UserTxBufferFS, (uint16_t)n);
+          _queue_cmd_reply(UserTxBufferFS, (uint16_t)n);
 
   } else if (strncmp(line, "GET:BTN", 7) == 0) {
       const UL_DispButtons_t *b = UL_Display_GetButtons();
@@ -366,7 +390,7 @@ static void _dispatch_cmd(const char *line)
                         (unsigned long)b->inc_count,
                         (unsigned long)b->dec_count);
       if (n > 0 && (size_t)n < APP_TX_DATA_SIZE)
-          CDC_Transmit_FS(UserTxBufferFS, (uint16_t)n);
+          _queue_cmd_reply(UserTxBufferFS, (uint16_t)n);
   } else if (strncmp(line, "GET:DRV", 7) == 0) {
       static const char * const drv_names[] = {
           "IDLE", "PRCHG", "READY", "RUN", "STOP", "FAULT"
@@ -375,10 +399,12 @@ static void _dispatch_cmd(const char *line)
       if ((int)ds < 0 || (int)ds > 5) ds = DRV_STATE_FAULT;
       uint16_t   ff = UL_Fault_Get();
       const UL_Meas_t *m = UL_Meas_Get();
+      uint32_t   bdtr = UL_SVPWM_ReadBDTR();
       unsigned ct = !HAL_GPIO_ReadPin(BRK_CUR_CPU_GPIO_Port, BRK_CUR_CPU_Pin);
+      unsigned dc = UL_Diag_GetCode();
       int n = snprintf((char *)UserTxBufferFS, APP_TX_DATA_SIZE,
                         "$DRV,S:%s,F:%04X,V:%.1f,IU:%.2f,IW:%.2f,"
-                        "S1:%u,S3:%u,BDTR:%08lX,MOE:%u,CT:%u\r\n",
+                        "S1:%u,S3:%u,BDTR:%08lX,MOE:%u,CT:%u,DC:%u\r\n",
                         drv_names[(int)ds],
                         (unsigned)ff,
                         (double)m->v_bus,
@@ -386,11 +412,33 @@ static void _dispatch_cmd(const char *line)
                         (double)m->i_w,
                         (unsigned)m->shunt1_raw,
                         (unsigned)m->shunt3_raw,
-                        (unsigned long)UL_SVPWM_ReadBDTR(),
-                        (unsigned)(UL_SVPWM_ReadBDTR() >> 15) & 1U,
-                        ct);
+                        (unsigned long)bdtr,
+                        (unsigned)((bdtr >> 15) & 1U),
+                        ct, dc);
       if (n > 0 && (size_t)n < APP_TX_DATA_SIZE)
-          CDC_Transmit_FS(UserTxBufferFS, (uint16_t)n);
+          _queue_cmd_reply(UserTxBufferFS, (uint16_t)n);
+
+  } else if (strncmp(line, "GET:DIAG", 8) == 0) {
+      uint8_t count = 0;
+      const DiagEntry_t *hist = UL_Diag_GetHistory(&count);
+      char *p = (char *)UserTxBufferFS;
+      int   rem = (int)APP_TX_DATA_SIZE;
+      int   w = snprintf(p, (size_t)rem, "$DIAG,DC:%u,N:%u",
+                          (unsigned)UL_Diag_GetCode(), (unsigned)count);
+      p += w; rem -= w;
+      for (uint8_t i = 0; i < count && rem > 20; i++) {
+          w = snprintf(p, (size_t)rem, ",H%u:%u@%lu",
+                        (unsigned)i,
+                        (unsigned)hist[i].code,
+                        (unsigned long)hist[i].tick_ms);
+          p += w; rem -= w;
+      }
+      w = snprintf(p, (size_t)rem, "\r\n");
+      p += w;
+      int total = (int)(p - (char *)UserTxBufferFS);
+      if (total > 0 && (size_t)total < APP_TX_DATA_SIZE)
+          _queue_cmd_reply(UserTxBufferFS, (uint16_t)total);
+
   } else if (strncmp(line, "GET:HEAP", 8) == 0) {
       extern osThreadId myTask01Handle, myTask02Handle,
                         myTask03Handle, myTask05Handle;
@@ -408,7 +456,7 @@ static void _dispatch_cmd(const char *line)
                         (unsigned)uxTaskGetStackHighWaterMark(
                             (TaskHandle_t)myTask05Handle));
       if (n > 0 && (size_t)n < APP_TX_DATA_SIZE)
-          CDC_Transmit_FS(UserTxBufferFS, (uint16_t)n);
+          _queue_cmd_reply(UserTxBufferFS, (uint16_t)n);
   }
 }
 
@@ -460,11 +508,40 @@ static int8_t CDC_TransmitCplt_FS(uint8_t *Buf, uint32_t *Len, uint8_t epnum)
   UNUSED(Buf);
   UNUSED(Len);
   UNUSED(epnum);
+  if (CmdReplyCount > 0U && Buf == CmdReplyQueue[CmdReplyHead]) {
+      CmdReplyHead = (uint8_t)((CmdReplyHead + 1U) % CMD_REPLY_QUEUE_DEPTH);
+      CmdReplyCount--;
+  }
+  _kick_cmd_reply_tx();
   /* USER CODE END 13 */
   return result;
 }
 
 /* USER CODE BEGIN PRIVATE_FUNCTIONS_IMPLEMENTATION */
+
+static void _queue_cmd_reply(const uint8_t *buf, uint16_t len)
+{
+    if (buf == NULL || len == 0U || len >= APP_TX_DATA_SIZE)
+        return;
+    if (CmdReplyCount >= CMD_REPLY_QUEUE_DEPTH)
+        return;
+
+    uint8_t tail = CmdReplyTail;
+    memcpy(CmdReplyQueue[tail], buf, len);
+    CmdReplyLen[tail] = len;
+    CmdReplyTail = (uint8_t)((tail + 1U) % CMD_REPLY_QUEUE_DEPTH);
+    CmdReplyCount++;
+
+    _kick_cmd_reply_tx();
+}
+
+static void _kick_cmd_reply_tx(void)
+{
+    if (CmdReplyCount == 0U)
+        return;
+
+    (void)CDC_Transmit_FS(CmdReplyQueue[CmdReplyHead], CmdReplyLen[CmdReplyHead]);
+}
 
 /* USER CODE END PRIVATE_FUNCTIONS_IMPLEMENTATION */
 
