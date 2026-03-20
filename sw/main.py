@@ -22,7 +22,7 @@ Firmware command set:
   GET:BTN                    read front-panel button state
 
 Firmware telemetry (periodic, no request needed):
-  $DRV,S:<state>,F:<hex>,V:<volts>,S1:<raw>,S3:<raw>,BDTR:<hex>,MOE:<0|1>
+  $DRV,S:<state>,F:<hex>,V:<volts>,IU:<amps>,IW:<amps>,S1:<raw>,S3:<raw>,BDTR:<hex>,MOE:<0|1>,CT:<0|1>
   $VBUS,RAW:<raw>,V:<volts>
 
 Dependencies: pip install PySide6 pyserial
@@ -423,9 +423,10 @@ class MainWindow(QMainWindow):
             state = parts.get("S", "IDLE")
             fault_hex = parts.get("F", "0000")
             volts = float(parts.get("V", "0"))
-            s1 = parts.get("S1", parts.get("IU", "0"))
-            s3 = parts.get("S3", parts.get("IW", "0"))
+            i_u = float(parts.get("IU", "0"))
+            i_w = float(parts.get("IW", "0"))
             moe = parts.get("MOE", "")
+            cur_trip = parts.get("CT", "0")
             fault_val = int(fault_hex, 16) if fault_hex else 0
         except (ValueError, KeyError):
             return
@@ -444,7 +445,8 @@ class MainWindow(QMainWindow):
         self._moe_lbl.setStyleSheet(
             f"color: {moe_color}; font-size: 10pt; font-weight: bold; {MONO}")
 
-        self._shunt_lbl.setText(f"IU:{s1}  IW:{s3}")
+        ct_str = " CUR_TRIP!" if cur_trip == "1" else ""
+        self._shunt_lbl.setText(f"IU:{i_u:+.1f}A  IW:{i_w:+.1f}A{ct_str}")
 
         self._vbus_value.setText(f"{volts:.0f}")
         vbus_color = ACCENT_RED_L if volts > 380 else (

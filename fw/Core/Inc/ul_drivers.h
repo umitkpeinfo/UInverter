@@ -135,6 +135,30 @@ uint32_t UL_SVPWM_ReadCR1(void);
 uint16_t UL_ReadVbusMon_Raw(void);
 float    UL_ReadVbusMon(void);
 
+/* ── Current Sensing — HCPL-7510 + shunt resistor ─────────────────────
+ *
+ *  Signal chain per channel:
+ *    Motor current → 2×5 mΩ parallel (2.5 mΩ) → HCPL-7510 → ADC
+ *
+ *  HCPL-7510 transfer (datasheet Note 2):
+ *    VOUT = VREF/2 + V_shunt × (VREF / 512 mV)
+ *    where V_shunt = I × R_SHUNT
+ *
+ *  Solving for I from 12-bit ADC raw:
+ *    I = raw × HALL_A_PER_LSB - HALL_OFFSET_A
+ */
+#define HALL_R_SHUNT       0.0025f     /* 2 × 5 mΩ parallel              */
+#define HALL_OPTO_VREF     4.0f        /* HCPL-7510 VREF pin (adjust if differs) */
+#define HALL_ADC_VREF      3.3f
+#define HALL_ADC_COUNTS    4096.0f
+
+#define HALL_OPTO_GAIN     (HALL_OPTO_VREF / 0.512f)
+#define HALL_OPTO_VZERO    (HALL_OPTO_VREF / 2.0f)
+#define HALL_SENSITIVITY   (HALL_R_SHUNT * HALL_OPTO_GAIN)   /* V/A at VOUT */
+
+#define HALL_A_PER_LSB     (HALL_ADC_VREF / (HALL_ADC_COUNTS * HALL_SENSITIVITY))
+#define HALL_OFFSET_A      (HALL_OPTO_VZERO / HALL_SENSITIVITY)
+
 /* ── ISR Measurements (updated every switching cycle) ──────────────────
  *
  * Written atomically per-member in the SVPWM ISR (single 16/32-bit stores).
@@ -147,6 +171,8 @@ typedef struct {
     volatile uint16_t shunt3_raw;  /* Phase W current ADC raw (ADC3 IN7) */
     volatile uint16_t vbus_raw;    /* DC bus voltage  ADC raw (ADC3 IN6) */
     volatile float    v_bus;       /* DC bus voltage in volts             */
+    volatile float    i_u;         /* Phase U current in amps             */
+    volatile float    i_w;         /* Phase W current in amps             */
 } UL_Meas_t;
 
 const UL_Meas_t *UL_Meas_Get(void);

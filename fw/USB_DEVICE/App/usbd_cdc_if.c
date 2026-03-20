@@ -10,16 +10,16 @@
   *
   *   SET commands (PC → FW):
   *     SET:FREQ:<hz>                  output frequency (1-400 Hz)
-  *     SET:SWF:<hz>                   switching frequency (1-20 kHz)
+  *     SET:SWF:<hz>                   switching frequency (1-16 kHz)
   *     SET:MOD:<0-1155>               modulation index (per-mille)
-  *     SET:SVPWM:0                    disable PWM outputs
-  *     SET:CHG:STOP|CLEAR             stop precharge / clear fault
+  *     SET:SVPWM:0                    emergency stop (PWM + relay + state)
+  *     SET:CHG:STOP|CLEAR             stop drive / clear charge fault
   *     SET:DRV:START|RUN|STOP|RESET   drive state machine
   *     SET:DISP:<text>                front-panel display text
   *
   *   GET commands (FW → PC, response prefixed with $):
   *     GET:REG    → $REG,BDTR:…,CCER:…,CR1:…
-  *     GET:DRV    → $DRV,S:…,F:…,V:…,IU:…,IW:…
+  *     GET:DRV    → $DRV,S:…,F:…,V:…,IU:…,IW:…,CT:…
   *     GET:BTN    → $BTN,RAW:…,SCR:…,INC:…,DEC:…
   *     GET:HEAP   → $HEAP,FREE:…,MIN:…,T01:…,T02:…,T03:…,T05:…
   *
@@ -317,14 +317,14 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
 
   } else if (strncmp(line, "SET:SVPWM:", 10) == 0) {
       if (strtoul(line + 10, NULL, 10) == 0)
-          UL_SVPWM_Disable();
+          UL_Drive_Stop();
 
   /* ── Charge relay / drive state machine commands ────────────── */
 
   } else if (strncmp(line, "SET:CHG:", 8) == 0) {
       const char *arg = line + 8;
       if (strcmp(arg, "STOP") == 0 || strcmp(arg, "0") == 0)
-          UL_Charge_Stop();
+          UL_Drive_Stop();
       else if (strcmp(arg, "CLEAR") == 0)
           UL_Charge_ClearFault();
 
@@ -369,13 +369,15 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
       if ((int)ds < 0 || (int)ds > 5) ds = DRV_STATE_FAULT;
       uint16_t   ff = UL_Fault_Get();
       const UL_Meas_t *m = UL_Meas_Get();
+      unsigned ct = !HAL_GPIO_ReadPin(BRK_CUR_CPU_GPIO_Port, BRK_CUR_CPU_Pin);
       int n = snprintf((char *)UserTxBufferFS, APP_TX_DATA_SIZE,
-                        "$DRV,S:%s,F:%04X,V:%.1f,IU:%u,IW:%u\r\n",
+                        "$DRV,S:%s,F:%04X,V:%.1f,IU:%.2f,IW:%.2f,CT:%u\r\n",
                         drv_names[(int)ds],
                         (unsigned)ff,
                         (double)m->v_bus,
-                        (unsigned)m->shunt1_raw,
-                        (unsigned)m->shunt3_raw);
+                        (double)m->i_u,
+                        (double)m->i_w,
+                        ct);
       if (n > 0 && (size_t)n < APP_TX_DATA_SIZE)
           CDC_Transmit_FS(UserTxBufferFS, (uint16_t)n);
   } else if (strncmp(line, "GET:HEAP", 8) == 0) {

@@ -211,21 +211,7 @@ void HAL_TIM_PWM_MspInit(TIM_HandleTypeDef* htim_pwm)
     HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
     /* USER CODE BEGIN TIM1_MspInit 1 */
-
-    __HAL_RCC_GPIOE_CLK_ENABLE();
-    /**TIM1 BKIN GPIO Configuration
-    PE15    ------> TIM1_BKIN
-    */
-    {
-      GPIO_InitTypeDef GPIO_InitStruct = {0};
-      GPIO_InitStruct.Pin = BKIN_Pin;
-      GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-      GPIO_InitStruct.Pull = GPIO_PULLUP;
-      GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-      GPIO_InitStruct.Alternate = GPIO_AF1_TIM1;
-      HAL_GPIO_Init(BKIN_GPIO_Port, &GPIO_InitStruct);
-    }
-
+    /* PE15 → TIM1_BKIN already configured above by CubeMX (AF1, PULLUP) */
     /* USER CODE END TIM1_MspInit 1 */
 
   }

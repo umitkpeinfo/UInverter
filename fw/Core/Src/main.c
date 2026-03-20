@@ -628,16 +628,20 @@ void StartTask01(void const * argument)
     uint16_t   ff = UL_Fault_Get();
     const UL_Meas_t *m = UL_Meas_Get();
 
-    static char dbg[160];
+    static char dbg[208];
+    unsigned cur_trip = !HAL_GPIO_ReadPin(BRK_CUR_CPU_GPIO_Port, BRK_CUR_CPU_Pin);
     int n = snprintf(dbg, sizeof(dbg),
-                     "$DRV,S:%s,F:%04X,V:%.1f,S1:%u,S3:%u,BDTR:%08lX,MOE:%u\r\n",
+                     "$DRV,S:%s,F:%04X,V:%.1f,IU:%.2f,IW:%.2f,S1:%u,S3:%u,BDTR:%08lX,MOE:%u,CT:%u\r\n",
                      drv_names[(int)ds],
                      (unsigned)ff,
                      (double)m->v_bus,
+                     (double)m->i_u,
+                     (double)m->i_w,
                      (unsigned)m->shunt1_raw,
                      (unsigned)m->shunt3_raw,
                      (unsigned long)UL_SVPWM_ReadBDTR(),
-                     (unsigned)(UL_SVPWM_ReadBDTR() >> 15) & 1U);
+                     (unsigned)(UL_SVPWM_ReadBDTR() >> 15) & 1U,
+                     cur_trip);
     CDC_Transmit_FS((uint8_t *)dbg, (uint16_t)n);
     osDelay(1000);
   }

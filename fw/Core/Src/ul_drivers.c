@@ -31,6 +31,10 @@ extern ADC_HandleTypeDef hadc3;
 
 static volatile uint8_t _svpwm_enabled = 0;
 
+/* ── Drive state — declared early so BKIN ISR can set FAULT atomically ────── */
+
+static volatile DrvState_t drv_state = DRV_STATE_IDLE;
+
 /* ── Angle accumulator ───────────────────────────────────────────────── */
 
 /**
@@ -134,9 +138,9 @@ void UL_Fault_Clear(void)
 
 /**
  * Called from TIM1_BRK_TIM9_IRQHandler when BKIN fires (PE15 goes LOW).
- * MOE is already cleared by hardware at this point; we zero CCR and latch
- * the fault flag.  No UL_Fault_Set() call here — that would re-clear MOE
- * which is harmless but adds unnecessary latency in this ISR-0 context.
+ * MOE is already cleared by hardware at this point (~5 ns); we zero CCR,
+ * open the charge relay, latch the fault flag, and transition drv_state
+ * so the full software safe-state converges immediately (no 50 ms gap).
  */
 void UL_BKIN_IRQHandler(void)
 {
@@ -145,7 +149,11 @@ void UL_BKIN_IRQHandler(void)
     tim->CCR2 = 0;
     tim->CCR3 = 0;
     _svpwm_enabled = 0;
+
+    UL_ChargeSwitch(0);
+
     fault_flags |= FAULT_OVERCURRENT;
+    drv_state = DRV_STATE_FAULT;
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -429,13 +437,37 @@ void UL_SVPWM_Init(void)
  * ══════════════════════════════════════════════════════════════════════ */
 
 /**
+ * Check if CUR_TRIP is stuck active (PD10 = BRK_CUR_CPU, active LOW).
+ * Reads the pin multiple times — if it never reads HIGH, the trip line
+ * is latched or shorted and we must not enable MOE.
+ * Mirrors the M72 reference firmware's 10-read secondary check.
+ */
+static uint8_t _cur_trip_stuck(void)
+{
+    for (int i = 0; i < 10; i++) {
+        if (HAL_GPIO_ReadPin(BRK_CUR_CPU_GPIO_Port, BRK_CUR_CPU_Pin)
+            == GPIO_PIN_SET)
+            return 0;
+    }
+    return 1;
+}
+
+/**
  * Enable SVPWM output — the ONLY place MOE is set.
  * Pre-loads CCR to 50% duty (neutral voltage) so the first PWM cycle
  * does not produce a current spike before the ISR computes real duties.
+ *
+ * Refuses to enable if CUR_TRIP (PD10) is stuck low — sets F1 instead.
  */
 void UL_SVPWM_Enable(void)
 {
     if (UL_Fault_IsTripped()) return;
+
+    if (_cur_trip_stuck()) {
+        UL_Fault_Set(FAULT_OVERCURRENT);
+        return;
+    }
+
     TIM_TypeDef *tim = htim1.Instance;
 
     uint32_t primask = __get_PRIMASK();
@@ -485,10 +517,15 @@ uint8_t UL_SVPWM_IsEnabled(void)
 void UL_SVPWM_ISR(void)
 {
     /* --- Read ADC injected results (from previous trigger) --- */
-    isr_meas.shunt1_raw = (uint16_t)(ADC1->JDR1 & 0xFFFU);
-    isr_meas.shunt3_raw = (uint16_t)(ADC3->JDR1 & 0xFFFU);
+    uint16_t s1 = (uint16_t)(ADC1->JDR1 & 0xFFFU);
+    uint16_t s3 = (uint16_t)(ADC3->JDR1 & 0xFFFU);
+
+    isr_meas.shunt1_raw = s1;
+    isr_meas.shunt3_raw = s3;
     isr_meas.vbus_raw   = (uint16_t)(ADC3->JDR2 & 0xFFFU);
-    isr_meas.v_bus       = _vbus_from_raw(isr_meas.vbus_raw);
+    isr_meas.v_bus      = _vbus_from_raw(isr_meas.vbus_raw);
+    isr_meas.i_u        = (float)s1 * HALL_A_PER_LSB - HALL_OFFSET_A;
+    isr_meas.i_w        = (float)s3 * HALL_A_PER_LSB - HALL_OFFSET_A;
 
     /* --- Bus voltage protection (3 consecutive readings, matching M72) --- */
     {
@@ -563,9 +600,9 @@ void UL_SVPWM_SetOutFreq(uint32_t freq_hz)   /* 1..400 Hz */
     _recalc_params();
 }
 
-void UL_SVPWM_SetSwFreq(uint32_t freq_hz)    /* 1..20 kHz */
+void UL_SVPWM_SetSwFreq(uint32_t freq_hz)    /* 1..16 kHz (FP15R12W1T4 thermal limit) */
 {
-    if (freq_hz < 1000 || freq_hz > 20000) return;
+    if (freq_hz < 1000 || freq_hz > 16000) return;
     svpwm_sw_freq = freq_hz;
     _recalc_params();
 }
@@ -779,8 +816,6 @@ uint8_t     UL_Charge_BusReady(void) { return chg_state == CHG_STATE_RUNNING ? 1
  *  Any state → FAULT → (clear) ───────────────────┘
  * ══════════════════════════════════════════════════════════════════════ */
 
-static volatile DrvState_t drv_state = DRV_STATE_IDLE;
-
 DrvState_t UL_Drive_GetState(void) { return drv_state; }
 
 void UL_Drive_Start(void)
@@ -804,10 +839,15 @@ void UL_Drive_Run(void)
 
 void UL_Drive_Stop(void)
 {
-    if (drv_state == DRV_STATE_RUN || drv_state == DRV_STATE_READY) {
-        UL_SVPWM_Disable();
-        drv_state = DRV_STATE_STOPPING;
-    }
+    if (drv_state == DRV_STATE_IDLE || drv_state == DRV_STATE_FAULT) return;
+
+    UL_SVPWM_Disable();
+    UL_ChargeSwitch(0);
+    UL_Charge_Stop();
+    regen_active = 0;
+    HAL_GPIO_WritePin(BRK_ON_GPIO_Port, BRK_ON_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(BRK_EN_GPIO_Port, BRK_EN_Pin, GPIO_PIN_RESET);
+    drv_state = DRV_STATE_IDLE;
 }
 
 void UL_Drive_Reset(void)
@@ -847,11 +887,17 @@ void UL_Drive_Tick(void)
         break;
 
     case DRV_STATE_READY:
+        if (isr_meas.v_bus < VBUS_UV_TRIP_V) {
+            UL_Fault_Set(FAULT_BUS_COLLAPSE);
+        }
         break;
 
     case DRV_STATE_RUN:
-        if (isr_meas.v_bus < VBUS_UV_TRIP_V && isr_meas.v_bus > 1.0f) {
+        if (isr_meas.v_bus < VBUS_UV_TRIP_V) {
             UL_Fault_Set(FAULT_UNDERVOLTAGE);
+        }
+        if (_cur_trip_stuck()) {
+            UL_Fault_Set(FAULT_OVERCURRENT);
         }
         break;
 
