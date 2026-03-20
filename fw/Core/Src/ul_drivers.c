@@ -99,13 +99,18 @@ uint8_t  UL_Fault_IsTripped(void) { return fault_flags != FAULT_NONE ? 1U : 0U; 
 
 /**
  * Latch one or more fault bits and force a safe shutdown:
- *   1. Clear MOE → idle-state outputs (SET = HIGH → IGBTs OFF)
- *   2. Zero CCR so no duty is queued for the next cycle
- *   3. Open the charge relay to isolate the DC bus
+ *   1. Atomically OR mask into fault_flags (interrupt-safe against BKIN ISR)
+ *   2. Clear MOE → idle-state outputs (SET = HIGH → IGBTs OFF)
+ *   3. Zero CCR so no duty is queued for the next cycle
+ *   4. Open the charge relay to isolate the DC bus
+ *   5. Transition drv_state to FAULT immediately (no tick delay)
  */
 void UL_Fault_Set(uint16_t mask)
 {
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
     fault_flags |= mask;
+    __set_PRIMASK(primask);
 
     TIM_TypeDef *tim = htim1.Instance;
     tim->BDTR &= ~TIM_BDTR_MOE;
@@ -116,6 +121,7 @@ void UL_Fault_Set(uint16_t mask)
     _svpwm_enabled = 0;
 
     UL_ChargeSwitch(0);
+    drv_state = DRV_STATE_FAULT;
 }
 
 void UL_Fault_Clear(void)
@@ -834,6 +840,10 @@ void UL_Drive_Run(void)
         return;
     }
     UL_SVPWM_Enable();
+    if (UL_Fault_IsTripped()) {
+        drv_state = DRV_STATE_FAULT;
+        return;
+    }
     drv_state = DRV_STATE_RUN;
 }
 

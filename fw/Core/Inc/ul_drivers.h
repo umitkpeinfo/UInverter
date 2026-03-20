@@ -57,11 +57,11 @@ extern "C" {
 /* ── Fault System ────────────────────────────────────────────────────── */
 
 #define FAULT_NONE          0x0000U
-#define FAULT_OVERCURRENT   0x0001U  /* F1 — BKIN hardware trip (PE15 CUR_TRIP) */
+#define FAULT_OVERCURRENT   0x0001U  /* F1 — BKIN hw trip on PE15, or SW _cur_trip_stuck() via PD10 */
 #define FAULT_OVERVOLTAGE   0x0002U  /* F5 — bus OV, 3 consecutive ISR readings */
 #define FAULT_UNDERVOLTAGE  0x0004U  /* bus UV during RUN */
-#define FAULT_BUS_COLLAPSE  0x0008U  /* bus collapsed during RUN */
-#define FAULT_PRECHARGE     0x0010U  /* precharge timeout or failure */
+#define FAULT_BUS_COLLAPSE  0x0008U  /* bus UV during READY or RUN (below VBUS_UV_TRIP_V) */
+#define FAULT_PRECHARGE     0x0010U  /* precharge timeout/failure, or ADC injected-init error */
 
 uint16_t UL_Fault_Get(void);
 uint8_t  UL_Fault_IsTripped(void);

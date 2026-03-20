@@ -11,7 +11,7 @@ USB CDC serial monitor for 6-channel SVPWM inverter (UltraLogic R1).
 
 Firmware command set:
   SET:FREQ:<hz>              output frequency 1-400 Hz
-  SET:SWF:<hz>               switching frequency 1000-20000 Hz
+  SET:SWF:<hz>               switching frequency 1000-16000 Hz
   SET:MOD:<0-1155>           modulation index per-mille
   SET:SVPWM:0                disable PWM outputs
   SET:CHG:STOP|CLEAR         stop precharge / clear charge fault
@@ -685,7 +685,7 @@ class MainWindow(QMainWindow):
         self._spin_freq = _make_param(
             "OUT FREQ", "Hz", ACCENT_GREEN_L, 1, 400, 60, 5)
         self._spin_swf = _make_param(
-            "SW FREQ", "Hz", PE_BLUE_LIGHT, 1000, 20000, 5000, 500)
+            "SW FREQ", "Hz", PE_BLUE_LIGHT, 1000, 16000, 5000, 500)
         self._spin_mod = _make_param(
             "MOD IDX", "\u2030", ACCENT_YELLOW_L, 0, 1155, 850, 10)
 

@@ -19,7 +19,7 @@
   *
   *   GET commands (FW → PC, response prefixed with $):
   *     GET:REG    → $REG,BDTR:…,CCER:…,CR1:…
-  *     GET:DRV    → $DRV,S:…,F:…,V:…,IU:…,IW:…,CT:…
+  *     GET:DRV    → $DRV,S:…,F:…,V:…,IU:…,IW:…,S1:…,S3:…,BDTR:…,MOE:…,CT:…
   *     GET:BTN    → $BTN,RAW:…,SCR:…,INC:…,DEC:…
   *     GET:HEAP   → $HEAP,FREE:…,MIN:…,T01:…,T02:…,T03:…,T05:…
   *
@@ -284,26 +284,32 @@ static int8_t CDC_Control_FS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
   * @param  Len: Number of data received (in bytes)
   * @retval Result of the operation: USBD_OK if all operations are OK else USBD_FAIL
   */
+static void _dispatch_cmd(const char *line);
+
 static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
 {
   /* USER CODE BEGIN 6 */
   if (*Len >= APP_RX_DATA_SIZE)
       *Len = APP_RX_DATA_SIZE - 1;
   Buf[*Len] = '\0';
-  char *line = (char *)Buf;
 
-  while (*line == '\r' || *line == '\n' || *line == ' ') line++;
-  size_t len = strlen(line);
-  if (len > 0) {
-      char *end = line + len - 1;
-      while (end > line && (*end == '\r' || *end == '\n' || *end == ' ')) *end-- = '\0';
-  }
-  if (*line == '\0') {
-      USBD_CDC_SetRxBuffer(&hUsbDeviceFS, &Buf[0]);
-      USBD_CDC_ReceivePacket(&hUsbDeviceFS);
-      return (USBD_OK);
+  char *p = (char *)Buf;
+  char *tok;
+  while ((tok = strtok(p, "\r\n")) != NULL) {
+      p = NULL;
+      while (*tok == ' ') tok++;
+      if (*tok != '\0')
+          _dispatch_cmd(tok);
   }
 
+  USBD_CDC_SetRxBuffer(&hUsbDeviceFS, &Buf[0]);
+  USBD_CDC_ReceivePacket(&hUsbDeviceFS);
+  return (USBD_OK);
+  /* USER CODE END 6 */
+}
+
+static void _dispatch_cmd(const char *line)
+{
   /* ── SVPWM parameter commands ──────────────────────────────────── */
 
   if (strncmp(line, "SET:FREQ:", 9) == 0) {
@@ -326,7 +332,7 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
       if (strcmp(arg, "STOP") == 0 || strcmp(arg, "0") == 0)
           UL_Drive_Stop();
       else if (strcmp(arg, "CLEAR") == 0)
-          UL_Charge_ClearFault();
+          UL_Drive_Reset();
 
   } else if (strncmp(line, "SET:DRV:", 8) == 0) {
       const char *arg = line + 8;
@@ -371,12 +377,17 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
       const UL_Meas_t *m = UL_Meas_Get();
       unsigned ct = !HAL_GPIO_ReadPin(BRK_CUR_CPU_GPIO_Port, BRK_CUR_CPU_Pin);
       int n = snprintf((char *)UserTxBufferFS, APP_TX_DATA_SIZE,
-                        "$DRV,S:%s,F:%04X,V:%.1f,IU:%.2f,IW:%.2f,CT:%u\r\n",
+                        "$DRV,S:%s,F:%04X,V:%.1f,IU:%.2f,IW:%.2f,"
+                        "S1:%u,S3:%u,BDTR:%08lX,MOE:%u,CT:%u\r\n",
                         drv_names[(int)ds],
                         (unsigned)ff,
                         (double)m->v_bus,
                         (double)m->i_u,
                         (double)m->i_w,
+                        (unsigned)m->shunt1_raw,
+                        (unsigned)m->shunt3_raw,
+                        (unsigned long)UL_SVPWM_ReadBDTR(),
+                        (unsigned)(UL_SVPWM_ReadBDTR() >> 15) & 1U,
                         ct);
       if (n > 0 && (size_t)n < APP_TX_DATA_SIZE)
           CDC_Transmit_FS(UserTxBufferFS, (uint16_t)n);
@@ -399,11 +410,6 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
       if (n > 0 && (size_t)n < APP_TX_DATA_SIZE)
           CDC_Transmit_FS(UserTxBufferFS, (uint16_t)n);
   }
-
-  USBD_CDC_SetRxBuffer(&hUsbDeviceFS, &Buf[0]);
-  USBD_CDC_ReceivePacket(&hUsbDeviceFS);
-  return (USBD_OK);
-  /* USER CODE END 6 */
 }
 
 /**
