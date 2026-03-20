@@ -1,11 +1,15 @@
 /**
  * @file    ul_drivers.h
- * @brief   UltraLogic R1 — 6-channel SVPWM driver (3 complementary pairs)
+ * @brief   UltraLogic R1 — 3-phase SVPWM inverter driver
  *
- * TIM1 complementary PWM outputs:
+ * TIM1 complementary PWM outputs (PE8-PE13):
  *   TIM1_CH1N PE8   FCU+     TIM1_CH1  PE9   FCU-
  *   TIM1_CH2N PE10  FCV+     TIM1_CH2  PE11  FCV-
  *   TIM1_CH3N PE12  FCW+     TIM1_CH3  PE13  FCW-
+ *
+ * TIM1 BKIN:
+ *   PE15 — hardware overcurrent fault input (active LOW, CUR_TRIP circuit)
+ *   Normal: HIGH (external pull-up R215).  Fault: optocoupler U12 pulls LOW.
  *
  * Copyright (c) 2026 PE Info.  All rights reserved.
  */
@@ -22,7 +26,7 @@ extern "C" {
 
 /* ── Firmware Info ────────────────────────────────────────────────────── */
 
-#define FW_VERSION_STR     "3.0.0"
+#define FW_VERSION_STR     "4.1.0"
 #define FW_HW_REVISION     "R1"
 #define FW_BUILD_DATE      __DATE__
 #define FW_BUILD_TIME      __TIME__
@@ -30,18 +34,64 @@ extern "C" {
 #define FW_COMPANY         "PE Info"
 #define FW_AUTHOR          "Umit Kayacik"
 
-/* ── SVPWM Configuration ─────────────────────────────────────────────── */
+/* ── SVPWM Configuration ─────────────────────────────────────────────
+ *
+ *  SYSCLK        = 216 MHz  (HSE 25 MHz, PLLN=432, PLLP=2, overdrive)
+ *  APB2          = 108 MHz  (SYSCLK/2)
+ *  TIM1 input    = 216 MHz  (2×APB2, since APB2 divider != 1)
+ *  TIM1 counter  = 216 MHz  (PSC=0, no prescaler)
+ *
+ *  SVPWM_TIM_CLK is the TIM1 INPUT clock (before prescaler).
+ *  Used for dead-time DTG calculation (DTG uses CK_INT, not prescaled).
+ *  ARR calculation uses counter clock = SVPWM_TIM_CLK / (PSC+1).
+ */
 
 #define SVPWM_LUT_SIZE         360U
-#define SVPWM_DEADTIME_NS      1000U
+#define SVPWM_DEADTIME_NS      2000U
 #define SVPWM_TIM_CLK          216000000U
 
-/* Default values (applied at init) */
 #define SVPWM_DEF_OUT_FREQ_HZ  60U
-#define SVPWM_DEF_SW_FREQ_HZ   5000U
+#define SVPWM_DEF_SW_FREQ_HZ   2000U
 #define SVPWM_DEF_MOD_INDEX    850U      /* per-mille (850 = 85.0%) */
 
-/* ── API ──────────────────────────────────────────────────────────────── */
+/* ── Fault System ────────────────────────────────────────────────────── */
+
+#define FAULT_NONE          0x0000U
+#define FAULT_OVERCURRENT   0x0001U  /* F1 — BKIN hardware trip (PE15 CUR_TRIP) */
+#define FAULT_OVERVOLTAGE   0x0002U  /* F5 — bus OV, 3 consecutive ISR readings */
+#define FAULT_UNDERVOLTAGE  0x0004U  /* bus UV during RUN */
+#define FAULT_BUS_COLLAPSE  0x0008U  /* bus collapsed during RUN */
+#define FAULT_PRECHARGE     0x0010U  /* precharge timeout or failure */
+
+uint16_t UL_Fault_Get(void);
+uint8_t  UL_Fault_IsTripped(void);
+void     UL_Fault_Set(uint16_t mask);
+void     UL_Fault_Clear(void);
+
+/* ── Drive State Machine ─────────────────────────────────────────────
+ *
+ *  IDLE → PRECHARGE → READY → RUN → STOPPING → IDLE
+ *    |        |          |       |        |
+ *    +--------+----------+-------+--------+--> FAULT --> (clear) --> IDLE
+ */
+
+typedef enum {
+    DRV_STATE_IDLE,
+    DRV_STATE_PRECHARGE,
+    DRV_STATE_READY,
+    DRV_STATE_RUN,
+    DRV_STATE_STOPPING,
+    DRV_STATE_FAULT
+} DrvState_t;
+
+DrvState_t UL_Drive_GetState(void);
+void       UL_Drive_Start(void);
+void       UL_Drive_Run(void);
+void       UL_Drive_Stop(void);
+void       UL_Drive_Reset(void);
+void       UL_Drive_Tick(void);
+
+/* ── SVPWM API ────────────────────────────────────────────────────────── */
 
 void    UL_SVPWM_Init(void);
 void    UL_SVPWM_ISR(void);
@@ -67,16 +117,10 @@ uint32_t UL_SVPWM_ReadCR1(void);
  *    V_bus → flyback XFMR → inverted aux winding (V_8v ≈ -V_bus / K)
  *    V_8v  → R-divider biased by +3.3V → V_mon (ADC input)
  *
- *  Divider transfer function:
- *    V_mon = VBUS_DIV_A × V_8v + VBUS_DIV_B
- *
  *  Combined (V_bus from ADC):
  *    V_bus = VBUS_M_OFFSET + adc16 × VBUS_M_GAIN   (GAIN is negative)
  *
  *  where adc16 = 12-bit raw << 4  (boosted to 16-bit range)
- *
- *  VBUS_XFMR_K calibrated from measurement:
- *    117.6 VAC → V_bus = 166.3 V (rectified), RAW ≈ 3494
  */
 #define VBUS_XFMR_K         16.95f
 #define VBUS_DIV_A           0.03710f
@@ -90,6 +134,31 @@ uint32_t UL_SVPWM_ReadCR1(void);
 
 uint16_t UL_ReadVbusMon_Raw(void);
 float    UL_ReadVbusMon(void);
+
+/* ── ISR Measurements (updated every switching cycle) ──────────────────
+ *
+ * Written atomically per-member in the SVPWM ISR (single 16/32-bit stores).
+ * Readers may see a mix of cycle N and N+1 across members; this is acceptable
+ * for telemetry.  Safety-critical decisions (OV/UV) use v_bus alone (atomic).
+ */
+
+typedef struct {
+    volatile uint16_t shunt1_raw;  /* Phase U current ADC raw (ADC1 IN5) */
+    volatile uint16_t shunt3_raw;  /* Phase W current ADC raw (ADC3 IN7) */
+    volatile uint16_t vbus_raw;    /* DC bus voltage  ADC raw (ADC3 IN6) */
+    volatile float    v_bus;       /* DC bus voltage in volts             */
+} UL_Meas_t;
+
+const UL_Meas_t *UL_Meas_Get(void);
+
+void UL_ADC_InjectInit(void);
+
+/* ── Bus Voltage Protection Thresholds ───────────────────────────────── */
+
+#define VBUS_OV_TRIP_V       420.0f   /* 1.27× 325V nominal → OV trip (F5) */
+#define VBUS_REGEN_ON_V      395.0f   /* 1.20× nominal → brake chopper ON */
+#define VBUS_REGEN_OFF_V     380.0f   /* 1.15× nominal → brake chopper OFF */
+#define VBUS_UV_TRIP_V       30.0f    /* undervoltage trip during RUN */
 
 /* ── DC Bus Pre-charge State Machine ─────────────────────────────────
  *
@@ -137,21 +206,28 @@ ChgFault_t  UL_Charge_GetFault(void);
 float       UL_Charge_GetVbus(void);
 uint8_t     UL_Charge_BusReady(void);
 
-/* ── DS1232 Watchdog Heartbeat (SOL_CPU on PG6) ──────────────────────
+/* ── DS1232 Watchdog Heartbeat (SOL_CPU on PG7) ──────────────────────
  *
  *  The DS1232 MicroMonitor requires a periodic falling edge on its
- *  ST (strobe) pin.  If no transition arrives before the timeout
- *  (set by TD pin: 150 ms / 600 ms / 1200 ms), the DS1232 asserts
- *  a hardware reset.
- *
- *  UL_Heartbeat_Toggle() simply toggles PG6, producing alternating
- *  rising/falling edges.  Call it from a periodic RTOS task at an
- *  interval well below the DS1232 timeout (e.g. every 50 ms).
+ *  ST (strobe) pin.  Call UL_Heartbeat_Toggle() every HEARTBEAT_PERIOD_MS.
  */
 
 #define HEARTBEAT_PERIOD_MS    50U
 
 void UL_Heartbeat_Toggle(void);
+
+/* ── Dynamic Braking (Regen) — brake chopper on PD13 / PD14 ──────────
+ *
+ *  Hysteresis control called from the SVPWM ISR:
+ *    v_bus > VBUS_REGEN_ON_V  → BRK_EN + BRK_ON asserted
+ *    v_bus < VBUS_REGEN_OFF_V → BRK_EN + BRK_ON released
+ */
+
+void UL_Regen_Service(float v_bus);
+
+/* ── BKIN ISR entry point (called from stm32f7xx_it.c) ───────────────── */
+
+void UL_BKIN_IRQHandler(void);
 
 #ifdef __cplusplus
 }

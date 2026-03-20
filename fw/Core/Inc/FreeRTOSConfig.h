@@ -136,7 +136,17 @@ standard names. */
 #define xPortSysTickHandler SysTick_Handler
 
 /* USER CODE BEGIN Defines */
-/* Section where parameter definitions can be added (for instance, to override default ones in FreeRTOS.h) */
+
+/* Stack overflow detection: method 2 checks both the stack pointer AND a
+ * watermark pattern at the end of the stack area.  Fires
+ * vApplicationStackOverflowHook() on overflow — essential during development
+ * to catch corruptions early on safety-critical tasks. */
+#define configCHECK_FOR_STACK_OVERFLOW  2
+
+/* Enable uxTaskGetStackHighWaterMark() for runtime stack usage queries
+ * (e.g. via GET:REG or debug prints). */
+#define INCLUDE_uxTaskGetStackHighWaterMark  1
+
 /* USER CODE END Defines */
 
 #endif /* FREERTOS_CONFIG_H */

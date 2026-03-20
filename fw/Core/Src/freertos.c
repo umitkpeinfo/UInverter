@@ -2,17 +2,11 @@
 /**
   ******************************************************************************
   * @file    freertos.c
-  * @brief   FreeRTOS support — idle task memory allocation
-  * @version 3.0
+  * @brief   FreeRTOS hooks — idle task memory, stack overflow handler
   *
   * @company PE Info
   * @author  Umit Kayacik
   * @date    2026
-  *
-  * @details
-  *   Task 01 (Normal) — USB CDC init, SVPWM init, periodic debug output.
-  *   Task 02–05       — Reserved (currently unused).
-  *
   ******************************************************************************
   * Copyright (c) 2026 PE Info.  All rights reserved.
   ******************************************************************************
@@ -72,6 +66,19 @@ void vApplicationGetIdleTaskMemory( StaticTask_t **ppxIdleTaskTCBBuffer, StackTy
 
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
+
+/**
+ * Called by FreeRTOS when a stack overflow is detected.
+ * Halts execution with interrupts disabled so the debugger can inspect
+ * the offending task name and stack pointer.
+ */
+void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
+{
+    (void)xTask;
+    (void)pcTaskName;
+    __disable_irq();
+    for (;;) { }
+}
 
 /* USER CODE END Application */
 

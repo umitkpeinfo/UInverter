@@ -1,9 +1,21 @@
 /**
  * @file    ul_drivers.c
- * @brief   UltraLogic R1 — 6-channel SVPWM (3 complementary pairs)
+ * @brief   UltraLogic R1 — 3-phase SVPWM inverter driver
  *
- * 60 Hz output, 5 kHz switching, 2-level voltage-source inverter.
- * Min-max (zero-sequence) injection for full SVPWM utilisation.
+ * Hardware configuration (MX-aligned):
+ *   SYSCLK  = 216 MHz  (HSE 25 MHz, PLLN=432, PLLP=2, overdrive enabled)
+ *   APB2    = 108 MHz  (SYSCLK/2)
+ *   TIM1    = 216 MHz input  (2×APB2), PSC=0 → 216 MHz counter, 2.0 µs dead time
+ *   BKIN    = PE15, active LOW (CUR_TRIP goes LOW on overcurrent)
+ *   Gate driver polarity: active LOW (HIGH = IGBT OFF)
+ *   Idle state: OCx/OCxN = SET (HIGH) → all IGBTs OFF when MOE cleared
+ *
+ * Safety architecture:
+ *   - MOE is OFF at boot; only UL_SVPWM_Enable() can set it after precharge
+ *   - Any fault immediately clears MOE, zeros CCR, opens charge relay
+ *   - BKIN hardware kills PWM in one TIM1 clock cycle (~6 ns)
+ *   - Overvoltage requires 3 consecutive ISR readings before trip (noise filter)
+ *   - No USB command can directly enable MOE (must go through state machine)
  *
  * Copyright (c) 2026 PE Info.  All rights reserved.
  */
@@ -12,15 +24,26 @@
 #include "main.h"
 
 extern TIM_HandleTypeDef htim1;
+extern ADC_HandleTypeDef hadc1;
 extern ADC_HandleTypeDef hadc3;
+
+/* ── Output enable flag (set only by UL_SVPWM_Enable, cleared on any fault) ─ */
+
+static volatile uint8_t _svpwm_enabled = 0;
 
 /* ── Angle accumulator ───────────────────────────────────────────────── */
 
+/**
+ * Electrical angle is tracked in milli-centi-degrees (0..35,999,999)
+ * for integer-only accumulation without drift.
+ *   360° × 100,000 = 36,000,000 counts per revolution
+ *   LUT index = angle_accum / 100,000  →  0..359
+ */
 #define ANGLE_FULL       36000000U
 #define ANGLE_TO_IDX     100000U
 
 static uint32_t angle_accum;
-static uint32_t angle_step;
+static uint32_t angle_step;  /* increment per ISR, set by _recalc_params() */
 
 static volatile uint32_t svpwm_out_freq  = SVPWM_DEF_OUT_FREQ_HZ;
 static volatile uint32_t svpwm_sw_freq   = SVPWM_DEF_SW_FREQ_HZ;
@@ -62,22 +85,119 @@ static const uint16_t sine_lut[SVPWM_LUT_SIZE] = {
 };
 
 /* ══════════════════════════════════════════════════════════════════════
- *  Dead-time DTG calculation — pure 32-bit, ceiling-rounded
+ *  Fault System
  * ══════════════════════════════════════════════════════════════════════ */
 
-/*
- * STM32 TIM1 DTG[7:0] encoding (RM0410 §25.4.18):
- *   0xxxxxxx → DT =         DTG[6:0]       ×  t_DTS
- *   10xxxxxx → DT = (64  + DTG[5:0]) × 2  ×  t_DTS
- *   110xxxxx → DT = (32  + DTG[4:0]) × 8  ×  t_DTS
- *   111xxxxx → DT = (32  + DTG[4:0]) × 16 ×  t_DTS
- *
- * All intermediate divisions use ceiling so the encoded dead-time
- * is always >= the requested value (safe for shoot-through prevention).
- *
- * dt_ticks = ceil(deadtime_ns × TIM_CLK / 10^9)
- *          = ceil(deadtime_ns × ceil(TIM_CLK / 10^6) / 10^3)   [32-bit]
+static volatile uint16_t fault_flags = FAULT_NONE;
+
+uint16_t UL_Fault_Get(void)       { return fault_flags; }
+uint8_t  UL_Fault_IsTripped(void) { return fault_flags != FAULT_NONE ? 1U : 0U; }
+
+/**
+ * Latch one or more fault bits and force a safe shutdown:
+ *   1. Clear MOE → idle-state outputs (SET = HIGH → IGBTs OFF)
+ *   2. Zero CCR so no duty is queued for the next cycle
+ *   3. Open the charge relay to isolate the DC bus
  */
+void UL_Fault_Set(uint16_t mask)
+{
+    fault_flags |= mask;
+
+    TIM_TypeDef *tim = htim1.Instance;
+    tim->BDTR &= ~TIM_BDTR_MOE;
+    __DSB();
+    tim->CCR1 = 0;
+    tim->CCR2 = 0;
+    tim->CCR3 = 0;
+    _svpwm_enabled = 0;
+
+    UL_ChargeSwitch(0);
+}
+
+void UL_Fault_Clear(void)
+{
+    if (fault_flags == FAULT_NONE) return;
+
+    TIM_TypeDef *tim = htim1.Instance;
+    tim->BDTR &= ~TIM_BDTR_MOE;
+    tim->CCR1 = 0;
+    tim->CCR2 = 0;
+    tim->CCR3 = 0;
+    _svpwm_enabled = 0;
+
+    fault_flags = FAULT_NONE;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+ *  BKIN ISR entry — called from TIM1_BRK_TIM9_IRQHandler
+ * ══════════════════════════════════════════════════════════════════════ */
+
+/**
+ * Called from TIM1_BRK_TIM9_IRQHandler when BKIN fires (PE15 goes LOW).
+ * MOE is already cleared by hardware at this point; we zero CCR and latch
+ * the fault flag.  No UL_Fault_Set() call here — that would re-clear MOE
+ * which is harmless but adds unnecessary latency in this ISR-0 context.
+ */
+void UL_BKIN_IRQHandler(void)
+{
+    TIM_TypeDef *tim = htim1.Instance;
+    tim->CCR1 = 0;
+    tim->CCR2 = 0;
+    tim->CCR3 = 0;
+    _svpwm_enabled = 0;
+    fault_flags |= FAULT_OVERCURRENT;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+ *  ISR Measurements — updated every switching cycle
+ * ══════════════════════════════════════════════════════════════════════ */
+
+static UL_Meas_t isr_meas;
+
+const UL_Meas_t *UL_Meas_Get(void) { return &isr_meas; }
+
+static float _vbus_from_raw(uint16_t raw)
+{
+    uint32_t adc16 = (uint32_t)raw << 4;
+    float v = VBUS_M_OFFSET + (float)adc16 * VBUS_M_GAIN;
+    return (v < 0.0f) ? 0.0f : v;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+ *  Dynamic Braking (Regen) — BRK_ON / BRK_EN on PD13 / PD14
+ * ══════════════════════════════════════════════════════════════════════ */
+
+static volatile uint8_t regen_active = 0;
+
+void UL_Regen_Service(float v_bus)
+{
+    if (v_bus > VBUS_REGEN_ON_V) {
+        if (!regen_active) {
+            HAL_GPIO_WritePin(BRK_EN_GPIO_Port, BRK_EN_Pin, GPIO_PIN_SET);
+            HAL_GPIO_WritePin(BRK_ON_GPIO_Port, BRK_ON_Pin, GPIO_PIN_SET);
+            regen_active = 1;
+        }
+    } else if (v_bus < VBUS_REGEN_OFF_V) {
+        if (regen_active) {
+            HAL_GPIO_WritePin(BRK_ON_GPIO_Port, BRK_ON_Pin, GPIO_PIN_RESET);
+            HAL_GPIO_WritePin(BRK_EN_GPIO_Port, BRK_EN_Pin, GPIO_PIN_RESET);
+            regen_active = 0;
+        }
+    }
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+ *  Dead-time DTG calculation — pure 32-bit, ceiling-rounded
+ *
+ *  STM32 TIM1 DTG[7:0] encoding (RM0410 §25.4.18):
+ *    0xxxxxxx → DT =         DTG[6:0]       ×  t_DTS
+ *    10xxxxxx → DT = (64  + DTG[5:0]) × 2  ×  t_DTS
+ *    110xxxxx → DT = (32  + DTG[4:0]) × 8  ×  t_DTS
+ *    111xxxxx → DT = (32  + DTG[4:0]) × 16 ×  t_DTS
+ *
+ *  tim_clk_hz = CK_INT (before prescaler), NOT the counter clock.
+ * ══════════════════════════════════════════════════════════════════════ */
+
 static uint8_t _calc_dtg(uint32_t tim_clk_hz, uint32_t deadtime_ns)
 {
     uint32_t clk_mhz  = (tim_clk_hz + 999999U) / 1000000U;
@@ -111,11 +231,12 @@ static uint8_t _calc_dtg(uint32_t tim_clk_hz, uint32_t deadtime_ns)
 }
 
 /* ══════════════════════════════════════════════════════════════════════
- *  Helpers
+ *  TIM1 Clock Detection & Parameter Calculation
  * ══════════════════════════════════════════════════════════════════════ */
 
 static uint32_t _tim1_clk_hz = SVPWM_TIM_CLK;
 
+/** Derive TIM1 input clock from the RCC configuration at runtime. */
 static uint32_t _get_tim1_clk(void)
 {
     RCC_ClkInitTypeDef clk;
@@ -125,9 +246,18 @@ static uint32_t _get_tim1_clk(void)
     return (clk.APB2CLKDivider == RCC_HCLK_DIV1) ? pclk2 : (2U * pclk2);
 }
 
+/**
+ * Recalculate ARR and angle_step from current output/switching frequencies.
+ * Called whenever f_out or f_sw changes, or during init.
+ *
+ * ARR = counter_clock / (2 × f_sw)     (center-aligned → 2× triangle)
+ * angle_step = f_out × 36,000,000 / f_sw  (split multiply to avoid u32 overflow)
+ */
 static void _recalc_params(void)
 {
-    uint32_t arr = _tim1_clk_hz / (2U * svpwm_sw_freq);
+    uint32_t psc = htim1.Instance->PSC;
+    uint32_t cnt_clk = _tim1_clk_hz / (psc + 1U);
+    uint32_t arr = cnt_clk / (2U * svpwm_sw_freq);
     uint32_t step = (uint32_t)((uint64_t)svpwm_out_freq * 10U * 3600000ULL
                                / svpwm_sw_freq);
     if (step == 0) step = 1;
@@ -139,21 +269,66 @@ static void _recalc_params(void)
     __set_PRIMASK(primask);
 }
 
+static volatile uint8_t _test_mode = 0;
+
+/* Snapshots captured after UL_SVPWM_Init() for debugger inspection */
 static volatile uint32_t _dbg_bdtr;
 static volatile uint32_t _dbg_ccer;
 static volatile uint8_t  _dbg_dtg;
 
-static volatile uint8_t _test_mode = 0;
+/* ══════════════════════════════════════════════════════════════════════
+ *  ADC Injected Channel Setup
+ *
+ *  ADC1 injected: channel 5 (PA5 / SHUNT1_AN) — phase U current
+ *  ADC3 injected: channel 7 (PF9 / SHUNT3_AN) — phase W current
+ *                 channel 6 (PF8 / VBUS_MON)   — DC bus voltage
+ *
+ *  Trigger: TIM1 TRGO (UPDATE event, once per PWM period)
+ * ══════════════════════════════════════════════════════════════════════ */
+
+void UL_ADC_InjectInit(void)
+{
+    ADC_InjectionConfTypeDef sInjConfig = {0};
+    HAL_StatusTypeDef rc;
+
+    sInjConfig.InjectedNbrOfConversion    = 1;
+    sInjConfig.InjectedDiscontinuousConvMode = DISABLE;
+    sInjConfig.AutoInjectedConv           = DISABLE;
+    sInjConfig.ExternalTrigInjecConv      = ADC_EXTERNALTRIGINJECCONV_T1_TRGO;
+    sInjConfig.ExternalTrigInjecConvEdge  = ADC_EXTERNALTRIGINJECCONVEDGE_RISING;
+
+    sInjConfig.InjectedChannel      = ADC_CHANNEL_5;
+    sInjConfig.InjectedRank         = ADC_INJECTED_RANK_1;
+    sInjConfig.InjectedSamplingTime = ADC_SAMPLETIME_15CYCLES;
+    sInjConfig.InjectedOffset       = 0;
+    rc = HAL_ADCEx_InjectedConfigChannel(&hadc1, &sInjConfig);
+    if (rc != HAL_OK) { UL_Fault_Set(FAULT_PRECHARGE); return; }
+
+    sInjConfig.InjectedNbrOfConversion = 2;
+    sInjConfig.InjectedChannel      = ADC_CHANNEL_7;
+    sInjConfig.InjectedRank         = ADC_INJECTED_RANK_1;
+    sInjConfig.InjectedSamplingTime = ADC_SAMPLETIME_15CYCLES;
+    sInjConfig.InjectedOffset       = 0;
+    rc = HAL_ADCEx_InjectedConfigChannel(&hadc3, &sInjConfig);
+    if (rc != HAL_OK) { UL_Fault_Set(FAULT_PRECHARGE); return; }
+
+    sInjConfig.InjectedChannel      = ADC_CHANNEL_6;
+    sInjConfig.InjectedRank         = ADC_INJECTED_RANK_2;
+    rc = HAL_ADCEx_InjectedConfigChannel(&hadc3, &sInjConfig);
+    if (rc != HAL_OK) { UL_Fault_Set(FAULT_PRECHARGE); return; }
+
+    rc = HAL_ADCEx_InjectedStart(&hadc1);
+    if (rc != HAL_OK) { UL_Fault_Set(FAULT_PRECHARGE); return; }
+
+    rc = HAL_ADCEx_InjectedStart(&hadc3);
+    if (rc != HAL_OK) { UL_Fault_Set(FAULT_PRECHARGE); return; }
+}
 
 /* ══════════════════════════════════════════════════════════════════════
  *  Init: start 6-ch complementary PWM + update ISR
  *
- *  ALL BDTR / CCER / MOE writes are DIRECT REGISTER operations —
- *  no HAL calls — to eliminate HAL channel-state and lock issues
- *  that could silently skip the dead-time or output-enable writes.
- *
- *  The entire sequence runs with interrupts disabled to prevent
- *  preemption during the transition from stopped → configured → running.
+ *  ALL BDTR / CCER / MOE writes are DIRECT REGISTER operations.
+ *  The entire sequence runs with interrupts disabled.
  * ══════════════════════════════════════════════════════════════════════ */
 
 void UL_SVPWM_Init(void)
@@ -167,104 +342,132 @@ void UL_SVPWM_Init(void)
 
     angle_accum = 0;
 
-    /* 1. Force safe state: stop counter, disable outputs, disable ISR */
+    /* 1. Force safe state */
     tim->CR1  &= ~TIM_CR1_CEN;
     tim->BDTR &= ~TIM_BDTR_MOE;
     tim->DIER &= ~TIM_DIER_UIE;
     __DSB();
 
-    /* 2. Clear all pending flags while outputs are in safe state */
+    /* 2. Clear all pending flags */
     tim->SR = 0U;
 
-    /* 3. RCR = 1 → one update event per full PWM cycle.
-     *    In center-aligned mode, RCR=0 fires at BOTH overflow and
-     *    underflow (2× per period), doubling the ISR rate and
-     *    output frequency.  RCR=1 fires once per period.           */
+    /* 3. RCR = 1 → one update per full PWM cycle */
     tim->RCR = 1;
 
-    /* 4. Recalculate ARR + angle_step ─────────────────────────────── */
+    /* 4. Recalculate ARR + angle_step */
     _recalc_params();
 
-    /* 5. Set initial compare values ───────────────────────────────── */
-    uint32_t arr = tim->ARR;
-    if (_test_mode) {
-        tim->CCR1 = arr / 2U;
-        tim->CCR2 = 0;
-        tim->CCR3 = 0;
-    } else {
-        tim->CCR1 = arr / 2U;
-        tim->CCR2 = arr / 2U;
-        tim->CCR3 = arr / 2U;
-    }
+    /* 5. Set initial compare values — ALL ZERO (outputs OFF) */
+    tim->CCR1 = 0;
+    tim->CCR2 = 0;
+    tim->CCR3 = 0;
 
-    /* 6. BDTR — direct register write (bypasses HAL entirely) ─────── */
+    /* 6. BDTR — dead time + break enable (read-modify-write to preserve BKF)
+     *    BKP=0 (active LOW, matching CUR_TRIP hardware)
+     *    BKE=1 (hardware break enabled)
+     *    OSSR=1 (off-state in RUN: outputs driven to idle level)
+     *    OSSI=1 (off-state in IDLE: outputs driven to idle level)
+     *    BKF is set by HAL_TIMEx_ConfigBreakDeadTime (filter = 4) and must
+     *    be preserved — a full register write would clear it to 0.
+     *    MOE is NOT set here — see UL_SVPWM_Enable() */
     uint8_t dtg = _calc_dtg(_tim1_clk_hz, SVPWM_DEADTIME_NS);
     _dbg_dtg = dtg;
 
-    uint32_t bdtr_val = (uint32_t)dtg
-                      | TIM_BDTR_OSSR
-                      | TIM_BDTR_OSSI;
-    tim->BDTR = bdtr_val;
-    __DSB();
-
-    if ((tim->BDTR & TIM_BDTR_DTG) != dtg)
     {
-        tim->BDTR = bdtr_val;
+        uint32_t bdtr = tim->BDTR;
+        bdtr &= ~(TIM_BDTR_DTG_Msk | TIM_BDTR_MOE);
+        bdtr |= (uint32_t)dtg
+              | TIM_BDTR_OSSR
+              | TIM_BDTR_OSSI
+              | TIM_BDTR_BKE;
+        tim->BDTR = bdtr;
         __DSB();
     }
 
-    /* 7. Enable output channels in CCER (direct register write) ───── */
+    /* 7. Enable output channels in CCER (Mode 2 + active-LOW polarity) */
     if (_test_mode) {
-        tim->CCER = TIM_CCER_CC1E | TIM_CCER_CC1NE;
+        tim->CCER = TIM_CCER_CC1E  | TIM_CCER_CC1P
+                  | TIM_CCER_CC1NE | TIM_CCER_CC1NP;
     } else {
-        tim->CCER = TIM_CCER_CC1E  | TIM_CCER_CC1NE
-                  | TIM_CCER_CC2E  | TIM_CCER_CC2NE
-                  | TIM_CCER_CC3E  | TIM_CCER_CC3NE;
+        tim->CCER = TIM_CCER_CC1E  | TIM_CCER_CC1P
+                  | TIM_CCER_CC1NE | TIM_CCER_CC1NP
+                  | TIM_CCER_CC2E  | TIM_CCER_CC2P
+                  | TIM_CCER_CC2NE | TIM_CCER_CC2NP
+                  | TIM_CCER_CC3E  | TIM_CCER_CC3P
+                  | TIM_CCER_CC3NE | TIM_CCER_CC3NP;
     }
 
-    /* 8. Configure update interrupt ───────────────────────────────── */
+    /* 8. Configure update interrupt (SVPWM ISR) */
     HAL_NVIC_SetPriority(TIM1_UP_TIM10_IRQn, 1, 0);
     HAL_NVIC_EnableIRQ(TIM1_UP_TIM10_IRQn);
     if (!_test_mode)
         tim->DIER |= TIM_DIER_UIE;
 
-    /* 9. Force update to load shadow registers, clear UIF ─────────── */
+    /* 9. Configure BKIN interrupt (priority 0 — highest) */
+    HAL_NVIC_SetPriority(TIM1_BRK_TIM9_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(TIM1_BRK_TIM9_IRQn);
+    tim->DIER |= TIM_DIER_BIE;
+
+    /* 10. Force update to load shadow registers, clear flags */
     tim->EGR = TIM_EGR_UG;
     tim->SR  = 0U;
     __DSB();
 
-    /* 10. Enable MOE, then start counter ──────────────────────────── */
-    tim->BDTR |= TIM_BDTR_MOE;
+    /* 11. Start counter, but keep MOE OFF — outputs remain disabled.
+     *     MOE is only set by UL_SVPWM_Enable() when the drive state
+     *     machine reaches RUN after a successful precharge. */
     tim->CR1  |= TIM_CR1_CEN;
 
     __set_PRIMASK(primask);
 
-    /* 11. Verify: read back registers ─────────────────────────────── */
     _dbg_bdtr = tim->BDTR;
     _dbg_ccer = tim->CCER;
 }
 
 /* ══════════════════════════════════════════════════════════════════════
  *  SVPWM Enable / Disable — controls MOE (Main Output Enable)
- *
- *  Disable clears MOE → all outputs go to IDLE (safe state per OSSI).
- *  Timer and ISR keep running so re-enable is instantaneous.
  * ══════════════════════════════════════════════════════════════════════ */
 
-static volatile uint8_t _svpwm_enabled = 1;
-
+/**
+ * Enable SVPWM output — the ONLY place MOE is set.
+ * Pre-loads CCR to 50% duty (neutral voltage) so the first PWM cycle
+ * does not produce a current spike before the ISR computes real duties.
+ */
 void UL_SVPWM_Enable(void)
 {
+    if (UL_Fault_IsTripped()) return;
     TIM_TypeDef *tim = htim1.Instance;
+
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+
+    uint32_t arr = tim->ARR;
+    tim->CCR1 = arr / 2U;
+    tim->CCR2 = arr / 2U;
+    tim->CCR3 = arr / 2U;
+    angle_accum = 0;
+
+    tim->EGR = TIM_EGR_UG;
+    tim->SR  = 0U;
+    __DSB();
+
     _svpwm_enabled = 1;
     tim->BDTR |= TIM_BDTR_MOE;
+
+    __set_PRIMASK(primask);
 }
 
 void UL_SVPWM_Disable(void)
 {
     TIM_TypeDef *tim = htim1.Instance;
-    _svpwm_enabled = 0;
+
     tim->BDTR &= ~TIM_BDTR_MOE;
+    __DSB();
+
+    tim->CCR1 = 0;
+    tim->CCR2 = 0;
+    tim->CCR3 = 0;
+    _svpwm_enabled = 0;
 }
 
 uint8_t UL_SVPWM_IsEnabled(void)
@@ -274,11 +477,45 @@ uint8_t UL_SVPWM_IsEnabled(void)
 
 /* ══════════════════════════════════════════════════════════════════════
  *  SVPWM ISR — called at switching frequency from TIM1 update
+ *
+ *  Reads ADC injected results from previous trigger, performs
+ *  bus voltage protection and regen, then computes new duty cycles.
  * ══════════════════════════════════════════════════════════════════════ */
 
 void UL_SVPWM_ISR(void)
 {
-    if (_test_mode) return;
+    /* --- Read ADC injected results (from previous trigger) --- */
+    isr_meas.shunt1_raw = (uint16_t)(ADC1->JDR1 & 0xFFFU);
+    isr_meas.shunt3_raw = (uint16_t)(ADC3->JDR1 & 0xFFFU);
+    isr_meas.vbus_raw   = (uint16_t)(ADC3->JDR2 & 0xFFFU);
+    isr_meas.v_bus       = _vbus_from_raw(isr_meas.vbus_raw);
+
+    /* --- Bus voltage protection (3 consecutive readings, matching M72) --- */
+    {
+        static uint8_t ov_trip_count = 0;
+        if (isr_meas.v_bus > VBUS_OV_TRIP_V) {
+            if (++ov_trip_count >= 3) {
+                UL_Fault_Set(FAULT_OVERVOLTAGE);
+                return;
+            }
+        } else {
+            ov_trip_count = 0;
+        }
+    }
+
+    /* --- Dynamic braking (regen) --- */
+    UL_Regen_Service(isr_meas.v_bus);
+
+    /* --- SVPWM duty calculation (sine LUT + min-max zero-sequence injection) ---
+     *
+     * 1. Look up three 120°-spaced sine values (0..10000, mid=5000)
+     * 2. Inject zero-sequence: offset = 5000 − (max+min)/2
+     *    This centers the waveforms and extends linear range to 2/√3 ≈ 1.155
+     * 3. Apply modulation index (per-mille) around the 5000 midpoint
+     * 4. Scale to CCR counts:  duty = result × ARR / 10000
+     */
+    if (!_svpwm_enabled || _test_mode) return;
+
     uint16_t idx_u = (uint16_t)(angle_accum / ANGLE_TO_IDX) % 360U;
     uint16_t idx_v = (idx_u + 120U) % 360U;
     uint16_t idx_w = (idx_u + 240U) % 360U;
@@ -287,13 +524,11 @@ void UL_SVPWM_ISR(void)
     uint16_t sv = sine_lut[idx_v];
     uint16_t sw = sine_lut[idx_w];
 
-    /* Min-max (zero-sequence) injection for SVPWM */
     uint16_t mx = su, mn = su;
     if (sv > mx) mx = sv;  if (sv < mn) mn = sv;
     if (sw > mx) mx = sw;  if (sw < mn) mn = sw;
     int16_t ofs = 5000 - (int16_t)((mx + mn) >> 1);
 
-    /* Scale by modulation index and map to timer ARR */
     int32_t m   = (int32_t)svpwm_mod_index;
     uint32_t arr = __HAL_TIM_GET_AUTORELOAD(&htim1);
 
@@ -312,28 +547,30 @@ void UL_SVPWM_ISR(void)
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, dv);
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, dw);
 
-    angle_accum = (angle_accum + angle_step) % ANGLE_FULL;
+    angle_accum += angle_step;
+    if (angle_accum >= ANGLE_FULL)
+        angle_accum -= ANGLE_FULL;
 }
 
 /* ══════════════════════════════════════════════════════════════════════
  *  Runtime setters (called from CDC command parser)
  * ══════════════════════════════════════════════════════════════════════ */
 
-void UL_SVPWM_SetOutFreq(uint32_t freq_hz)
+void UL_SVPWM_SetOutFreq(uint32_t freq_hz)   /* 1..400 Hz */
 {
     if (freq_hz == 0 || freq_hz > 400) return;
     svpwm_out_freq = freq_hz;
     _recalc_params();
 }
 
-void UL_SVPWM_SetSwFreq(uint32_t freq_hz)
+void UL_SVPWM_SetSwFreq(uint32_t freq_hz)    /* 1..20 kHz */
 {
     if (freq_hz < 1000 || freq_hz > 20000) return;
     svpwm_sw_freq = freq_hz;
     _recalc_params();
 }
 
-void UL_SVPWM_SetModIndex(uint32_t mod_permille)
+void UL_SVPWM_SetModIndex(uint32_t mod_permille) /* 0..1155 (max with SVPWM) */
 {
     if (mod_permille > 1155) return;
     svpwm_mod_index = mod_permille;
@@ -360,7 +597,7 @@ uint8_t UL_ChargeSwitch_State(void)
 }
 
 /* ══════════════════════════════════════════════════════════════════════
- *  Register readback (debug)
+ *  TIM1 Register Readback — used by GET:REG USB command and telemetry
  * ══════════════════════════════════════════════════════════════════════ */
 
 uint32_t UL_SVPWM_ReadBDTR(void) { return htim1.Instance->BDTR; }
@@ -368,13 +605,14 @@ uint32_t UL_SVPWM_ReadCCER(void) { return htim1.Instance->CCER; }
 uint32_t UL_SVPWM_ReadCR1(void)  { return htim1.Instance->CR1;  }
 
 /* ══════════════════════════════════════════════════════════════════════
- *  ADC — DC Bus Voltage Monitor (VBUS_MON on ADC3_IN6 / PF8)
+ *  ADC — DC Bus Voltage Monitor
  *
- *  Software channel switching: reconfigure ADC3 to channel 6, do a
- *  single polled conversion, then return.  Safe to call from any
- *  RTOS task (not ISR).
+ *  Primary path: ISR-cached isr_meas values (updated at f_sw).
+ *  Fallback: polled ADC3 regular conversion, used only during startup
+ *  before the first TIM1 update event triggers injected sampling.
  * ══════════════════════════════════════════════════════════════════════ */
 
+/** Polled single-shot read — startup fallback only, not ISR-safe. */
 static uint16_t _read_adc3_channel(uint32_t channel)
 {
     ADC_ChannelConfTypeDef cfg = {0};
@@ -398,11 +636,15 @@ static uint16_t _read_adc3_channel(uint32_t channel)
 
 uint16_t UL_ReadVbusMon_Raw(void)
 {
+    if (isr_meas.vbus_raw != 0)
+        return isr_meas.vbus_raw;
     return _read_adc3_channel(ADC_CHANNEL_6);
 }
 
 float UL_ReadVbusMon(void)
 {
+    if (isr_meas.v_bus > 0.0f)
+        return isr_meas.v_bus;
     uint32_t adc16 = (uint32_t)UL_ReadVbusMon_Raw() << 4;
     float vbus = VBUS_M_OFFSET + (float)adc16 * VBUS_M_GAIN;
     if (vbus < 0.0f) vbus = 0.0f;
@@ -411,15 +653,6 @@ float UL_ReadVbusMon(void)
 
 /* ══════════════════════════════════════════════════════════════════════
  *  DC Bus Pre-charge State Machine
- *
- *  On Start():
- *    1. Relay stays OPEN — cap charges through inrush resistors R1-R3
- *    2. Monitor V_bus until it stabilises (dV < CHG_STABLE_DV for
- *       CHG_STABLE_N consecutive ticks)
- *    3. Close relay, enter VERIFY — confirm bus didn't collapse
- *    4. Transition to RUNNING — bus is ready, relay stays closed
- *
- *  Over-voltage and timeout checks run in every active state.
  * ══════════════════════════════════════════════════════════════════════ */
 
 static volatile ChgState_t  chg_state      = CHG_STATE_IDLE;
@@ -538,10 +771,105 @@ ChgFault_t  UL_Charge_GetFault(void) { return chg_fault;     }
 float       UL_Charge_GetVbus(void)  { return chg_vbus_last; }
 uint8_t     UL_Charge_BusReady(void) { return chg_state == CHG_STATE_RUNNING ? 1U : 0U; }
 
+/* ══════════════════════════════════════════════════════════════════════
+ *  Drive State Machine
+ *
+ *  IDLE → PRECHARGE → READY → RUN → STOPPING → IDLE
+ *                                                 ↑
+ *  Any state → FAULT → (clear) ───────────────────┘
+ * ══════════════════════════════════════════════════════════════════════ */
+
+static volatile DrvState_t drv_state = DRV_STATE_IDLE;
+
+DrvState_t UL_Drive_GetState(void) { return drv_state; }
+
+void UL_Drive_Start(void)
+{
+    if (drv_state != DRV_STATE_IDLE) return;
+    if (UL_Fault_IsTripped()) return;
+    UL_Charge_Start();
+    drv_state = DRV_STATE_PRECHARGE;
+}
+
+void UL_Drive_Run(void)
+{
+    if (drv_state != DRV_STATE_READY) return;
+    if (UL_Fault_IsTripped()) {
+        drv_state = DRV_STATE_FAULT;
+        return;
+    }
+    UL_SVPWM_Enable();
+    drv_state = DRV_STATE_RUN;
+}
+
+void UL_Drive_Stop(void)
+{
+    if (drv_state == DRV_STATE_RUN || drv_state == DRV_STATE_READY) {
+        UL_SVPWM_Disable();
+        drv_state = DRV_STATE_STOPPING;
+    }
+}
+
+void UL_Drive_Reset(void)
+{
+    UL_SVPWM_Disable();
+    UL_ChargeSwitch(0);
+    UL_Charge_Stop();
+    UL_Fault_Clear();
+    regen_active = 0;
+    HAL_GPIO_WritePin(BRK_ON_GPIO_Port, BRK_ON_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(BRK_EN_GPIO_Port, BRK_EN_Pin, GPIO_PIN_RESET);
+    drv_state = DRV_STATE_IDLE;
+}
+
+void UL_Drive_Tick(void)
+{
+    if (UL_Fault_IsTripped() && drv_state != DRV_STATE_FAULT) {
+        UL_SVPWM_Disable();
+        UL_ChargeSwitch(0);
+        drv_state = DRV_STATE_FAULT;
+        return;
+    }
+
+    switch (drv_state) {
+
+    case DRV_STATE_IDLE:
+        break;
+
+    case DRV_STATE_PRECHARGE:
+        UL_Charge_Tick();
+        if (UL_Charge_GetState() == CHG_STATE_RUNNING) {
+            drv_state = DRV_STATE_READY;
+        } else if (UL_Charge_GetState() == CHG_STATE_FAULT) {
+            UL_Fault_Set(FAULT_PRECHARGE);
+            drv_state = DRV_STATE_FAULT;
+        }
+        break;
+
+    case DRV_STATE_READY:
+        break;
+
+    case DRV_STATE_RUN:
+        if (isr_meas.v_bus < VBUS_UV_TRIP_V && isr_meas.v_bus > 1.0f) {
+            UL_Fault_Set(FAULT_UNDERVOLTAGE);
+        }
+        break;
+
+    case DRV_STATE_STOPPING:
+        UL_SVPWM_Disable();
+        UL_ChargeSwitch(0);
+        UL_Charge_Stop();
+        drv_state = DRV_STATE_IDLE;
+        break;
+
+    case DRV_STATE_FAULT:
+        break;
+    }
+}
+
 /* ── DS1232 Watchdog Heartbeat ───────────────────────────────────────── */
 
 void UL_Heartbeat_Toggle(void)
 {
     HAL_GPIO_TogglePin(SOL_CPU_GPIO_Port, SOL_CPU_Pin);
 }
-

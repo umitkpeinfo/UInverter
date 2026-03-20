@@ -61,60 +61,48 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
-#define SPI_CS_EE_Pin GPIO_PIN_3
-#define SPI_CS_EE_GPIO_Port GPIOE
-#define SPI_CS_FLASH_Pin GPIO_PIN_4
-#define SPI_CS_FLASH_GPIO_Port GPIOE
 #define FAN_SW_Pin GPIO_PIN_13
 #define FAN_SW_GPIO_Port GPIOC
-#define AN_IN1_Pin GPIO_PIN_6
-#define AN_IN1_GPIO_Port GPIOF
-#define AN_IN2_Pin GPIO_PIN_7
-#define AN_IN2_GPIO_Port GPIOF
 #define VBUS_MON_Pin GPIO_PIN_8
 #define VBUS_MON_GPIO_Port GPIOF
 #define SHUNT3_AN_Pin GPIO_PIN_9
 #define SHUNT3_AN_GPIO_Port GPIOF
 #define SHUNT1_AN_Pin GPIO_PIN_5
 #define SHUNT1_AN_GPIO_Port GPIOA
-#define XPS_SENSE_Pin GPIO_PIN_1
-#define XPS_SENSE_GPIO_Port GPIOG
-#define FC_DATA_Pin GPIO_PIN_10
-#define FC_DATA_GPIO_Port GPIOD
-#define FC_CLK_Pin GPIO_PIN_11
-#define FC_CLK_GPIO_Port GPIOD
-#define FC_LATCH_Pin GPIO_PIN_12
-#define FC_LATCH_GPIO_Port GPIOD
-#define BRK_ON_Pin GPIO_PIN_13
-#define BRK_ON_GPIO_Port GPIOD
-#define BRK_EN_Pin GPIO_PIN_14
-#define BRK_EN_GPIO_Port GPIOD
-#define DI_DATA_Pin GPIO_PIN_15
-#define DI_DATA_GPIO_Port GPIOD
+#define BRK_CUR_CPU_Pin GPIO_PIN_10
+#define BRK_CUR_CPU_GPIO_Port GPIOD
+#define BRK_B_CPU_Pin GPIO_PIN_11
+#define BRK_B_CPU_GPIO_Port GPIOD
+#define NRST2_Pin GPIO_PIN_15
+#define NRST2_GPIO_Port GPIOD
+#define SOL_CPU_Pin GPIO_PIN_7
+#define SOL_CPU_GPIO_Port GPIOG
 #define USB_FAULT_Pin GPIO_PIN_8
 #define USB_FAULT_GPIO_Port GPIOG
-#define AO1_DIR_Pin GPIO_PIN_8
-#define AO1_DIR_GPIO_Port GPIOC
-#define AO2_DIR_Pin GPIO_PIN_9
-#define AO2_DIR_GPIO_Port GPIOC
 #define VBUS_SENSE_Pin GPIO_PIN_9
 #define VBUS_SENSE_GPIO_Port GPIOA
 #define USB_EN_Pin GPIO_PIN_10
 #define USB_EN_GPIO_Port GPIOA
-#define DI_CLK_Pin GPIO_PIN_3
-#define DI_CLK_GPIO_Port GPIOD
-#define DI_LOAD_Pin GPIO_PIN_4
-#define DI_LOAD_GPIO_Port GPIOD
+#define BRK_BD1_CPU_Pin GPIO_PIN_3
+#define BRK_BD1_CPU_GPIO_Port GPIOD
+#define BRK_BD2_CPU_Pin GPIO_PIN_4
+#define BRK_BD2_CPU_GPIO_Port GPIOD
 #define CHG_OUT_CPU_Pin GPIO_PIN_7
 #define CHG_OUT_CPU_GPIO_Port GPIOD
-#define AUX_REL1_Pin GPIO_PIN_13
-#define AUX_REL1_GPIO_Port GPIOG
 #define AUX_REL2_Pin GPIO_PIN_15
 #define AUX_REL2_GPIO_Port GPIOG
-#define SOL_CPU_Pin GPIO_PIN_7
-#define SOL_CPU_GPIO_Port GPIOG
 
 /* USER CODE BEGIN Private defines */
+
+/* BKIN — TIM1 break input for overcurrent (PE15, configured in MSP user code) */
+#define BKIN_Pin           GPIO_PIN_15
+#define BKIN_GPIO_Port     GPIOE
+
+/* Dynamic braking chopper IGBTs (active HIGH) */
+#define BRK_ON_Pin         GPIO_PIN_13
+#define BRK_ON_GPIO_Port   GPIOD
+#define BRK_EN_Pin         GPIO_PIN_14
+#define BRK_EN_GPIO_Port   GPIOD
 
 /* USER CODE END Private defines */
 

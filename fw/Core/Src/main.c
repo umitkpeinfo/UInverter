@@ -1,18 +1,24 @@
 /* USER CODE BEGIN Header */
 /**
   ******************************************************************************
-  * @file           : main.c
-  * @brief          : Main program body
-  ******************************************************************************
-  * @attention
+  * @file    main.c
+  * @brief   UltraLogic R1 — main application, FreeRTOS tasks, peripheral init
   *
-  * Copyright (c) 2026 STMicroelectronics.
-  * All rights reserved.
+  * @details
+  *   Task01 (Normal)      — USB CDC init, SVPWM/ADC init, 1 Hz telemetry
+  *   Task02 (Idle)        — Display poll (5 ms), VBUS telemetry (100 ms)
+  *   Task03 (Idle)        — Drive state machine tick (50 ms)
+  *   Task05 (AboveNormal) — DS1232 watchdog heartbeat (50 ms)
   *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *   Peripheral init order in Task01:
+  *     1. USB CDC + PHY enable
+  *     2. Display UART (USART1)
+  *     3. ADC injected channels (must precede SVPWM)
+  *     4. SVPWM timer (counter on, MOE off)
   *
+  * @company PE Info
+  * @author  Umit Kayacik
+  * @date    2026
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -24,6 +30,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "ul_drivers.h"
+#include "ul_display.h"
 #include "usbd_cdc_if.h"
 #include <stdio.h>
 /* USER CODE END Includes */
@@ -49,6 +56,8 @@ ADC_HandleTypeDef hadc3;
 
 TIM_HandleTypeDef htim1;
 
+UART_HandleTypeDef huart1;
+
 osThreadId myTask01Handle;
 osThreadId myTask02Handle;
 osThreadId myTask03Handle;
@@ -64,6 +73,7 @@ static void MX_GPIO_Init(void);
 static void MX_ADC3_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_ADC1_Init(void);
+static void MX_USART1_UART_Init(void);
 void StartTask01(void const * argument);
 void StartTask02(void const * argument);
 void StartTask03(void const * argument);
@@ -113,6 +123,7 @@ int main(void)
   MX_ADC3_Init();
   MX_TIM1_Init();
   MX_ADC1_Init();
+  MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
 
   /* USER CODE END 2 */
@@ -318,7 +329,7 @@ static void MX_ADC3_Init(void)
 
   /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
   */
-  sConfig.Channel = ADC_CHANNEL_4;
+  sConfig.Channel = ADC_CHANNEL_6;
   sConfig.Rank = ADC_REGULAR_RANK_1;
   sConfig.SamplingTime = ADC_SAMPLETIME_3CYCLES;
   if (HAL_ADC_ConfigChannel(&hadc3, &sConfig) != HAL_OK)
@@ -344,6 +355,7 @@ static void MX_TIM1_Init(void)
   /* USER CODE END TIM1_Init 0 */
 
   TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIMEx_BreakInputConfigTypeDef sBreakInputConfig = {0};
   TIM_OC_InitTypeDef sConfigOC = {0};
   TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
 
@@ -361,20 +373,29 @@ static void MX_TIM1_Init(void)
   {
     Error_Handler();
   }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_UPDATE;
   sMasterConfig.MasterOutputTrigger2 = TIM_TRGO2_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
   if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
   {
     Error_Handler();
   }
-  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sBreakInputConfig.Source = TIM_BREAKINPUTSOURCE_BKIN;
+  sBreakInputConfig.Enable = TIM_BREAKINPUTSOURCE_ENABLE;
+  /* POLARITY_HIGH = BKINP=0 = non-inverted; combined with BreakPolarity LOW
+     below, break fires when PE15 goes LOW (CUR_TRIP active) */
+  sBreakInputConfig.Polarity = TIM_BREAKINPUTSOURCE_POLARITY_HIGH;
+  if (HAL_TIMEx_ConfigBreakInput(&htim1, TIM_BREAKINPUT_BRK, &sBreakInputConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM2;
   sConfigOC.Pulse = 0;
-  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_LOW;
+  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_LOW;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
-  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+  sConfigOC.OCIdleState = TIM_OCIDLESTATE_SET;
+  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_SET;
   if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
   {
     Error_Handler();
@@ -391,9 +412,9 @@ static void MX_TIM1_Init(void)
   sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_ENABLE;
   sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
   sBreakDeadTimeConfig.DeadTime = 172;
-  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
-  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
-  sBreakDeadTimeConfig.BreakFilter = 0;
+  sBreakDeadTimeConfig.BreakState = TIM_BREAK_ENABLE;
+  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_LOW;
+  sBreakDeadTimeConfig.BreakFilter = 4;
   sBreakDeadTimeConfig.Break2State = TIM_BREAK2_DISABLE;
   sBreakDeadTimeConfig.Break2Polarity = TIM_BREAK2POLARITY_HIGH;
   sBreakDeadTimeConfig.Break2Filter = 0;
@@ -410,6 +431,41 @@ static void MX_TIM1_Init(void)
 }
 
 /**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -422,68 +478,62 @@ static void MX_GPIO_Init(void)
   /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
-  __HAL_RCC_GPIOE_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOF_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
-  __HAL_RCC_GPIOG_CLK_ENABLE();
+  __HAL_RCC_GPIOE_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
+  __HAL_RCC_GPIOG_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOE, SPI_CS_EE_Pin|SPI_CS_FLASH_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(FAN_SW_GPIO_Port, FAN_SW_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOC, FAN_SW_Pin|AO1_DIR_Pin|AO2_DIR_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOD, BRK_B_CPU_Pin|BRK_BD1_CPU_Pin|BRK_BD2_CPU_Pin|CHG_OUT_CPU_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOD, FC_DATA_Pin|FC_CLK_Pin|FC_LATCH_Pin|BRK_ON_Pin
-                          |BRK_EN_Pin|DI_CLK_Pin|DI_LOAD_Pin|CHG_OUT_CPU_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(SOL_CPU_GPIO_Port, SOL_CPU_Pin, GPIO_PIN_SET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(USB_EN_GPIO_Port, USB_EN_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOG, AUX_REL1_Pin|AUX_REL2_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(AUX_REL2_GPIO_Port, AUX_REL2_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(SOL_CPU_GPIO_Port, SOL_CPU_Pin, GPIO_PIN_SET);
-
-  /*Configure GPIO pins : SPI_CS_EE_Pin SPI_CS_FLASH_Pin */
-  GPIO_InitStruct.Pin = SPI_CS_EE_Pin|SPI_CS_FLASH_Pin;
+  /*Configure GPIO pin : FAN_SW_Pin */
+  GPIO_InitStruct.Pin = FAN_SW_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+  HAL_GPIO_Init(FAN_SW_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : FAN_SW_Pin AO1_DIR_Pin AO2_DIR_Pin */
-  GPIO_InitStruct.Pin = FAN_SW_Pin|AO1_DIR_Pin|AO2_DIR_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : XPS_SENSE_Pin USB_FAULT_Pin */
-  GPIO_InitStruct.Pin = XPS_SENSE_Pin|USB_FAULT_Pin;
+  /*Configure GPIO pins : BRK_CUR_CPU_Pin NRST2_Pin */
+  GPIO_InitStruct.Pin = BRK_CUR_CPU_Pin|NRST2_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIOG, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : FC_DATA_Pin FC_CLK_Pin FC_LATCH_Pin BRK_ON_Pin
-                           BRK_EN_Pin DI_CLK_Pin DI_LOAD_Pin CHG_OUT_CPU_Pin */
-  GPIO_InitStruct.Pin = FC_DATA_Pin|FC_CLK_Pin|FC_LATCH_Pin|BRK_ON_Pin
-                          |BRK_EN_Pin|DI_CLK_Pin|DI_LOAD_Pin|CHG_OUT_CPU_Pin;
+  /*Configure GPIO pins : BRK_B_CPU_Pin BRK_BD1_CPU_Pin BRK_BD2_CPU_Pin CHG_OUT_CPU_Pin */
+  GPIO_InitStruct.Pin = BRK_B_CPU_Pin|BRK_BD1_CPU_Pin|BRK_BD2_CPU_Pin|CHG_OUT_CPU_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : DI_DATA_Pin */
-  GPIO_InitStruct.Pin = DI_DATA_Pin;
+  /*Configure GPIO pins : SOL_CPU_Pin AUX_REL2_Pin */
+  GPIO_InitStruct.Pin = SOL_CPU_Pin|AUX_REL2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOG, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : USB_FAULT_Pin */
+  GPIO_InitStruct.Pin = USB_FAULT_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(DI_DATA_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(USB_FAULT_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : VBUS_SENSE_Pin */
   GPIO_InitStruct.Pin = VBUS_SENSE_Pin;
@@ -498,32 +548,62 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(USB_EN_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : AUX_REL1_Pin AUX_REL2_Pin */
-  GPIO_InitStruct.Pin = AUX_REL1_Pin|AUX_REL2_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOG, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : SOL_CPU_Pin (DS1232 watchdog strobe) */
-  GPIO_InitStruct.Pin = SOL_CPU_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(SOL_CPU_GPIO_Port, &GPIO_InitStruct);
-
   /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* Dynamic braking chopper outputs — OFF at boot (PD13 = BRK_ON, PD14 = BRK_EN) */
+  HAL_GPIO_WritePin(GPIOD, BRK_ON_Pin | BRK_EN_Pin, GPIO_PIN_RESET);
+  GPIO_InitStruct.Pin = BRK_ON_Pin | BRK_EN_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
 
+/**
+ * Format the front-panel display string based on drive state.
+ * Returns a 6-char string for the 14-segment display.
+ */
+static const char *_format_display(void)
+{
+    static char buf[8];
+    DrvState_t ds = UL_Drive_GetState();
+    uint16_t   ff = UL_Fault_Get();
+
+    if (ff != FAULT_NONE) {
+        snprintf(buf, sizeof(buf), "F %04X", (unsigned)ff);
+        return buf;
+    }
+
+    switch (ds) {
+    case DRV_STATE_IDLE:      return " IDLE ";
+    case DRV_STATE_PRECHARGE: return " PRCHG";
+    case DRV_STATE_READY:     return " READY";
+    case DRV_STATE_RUN: {
+        const UL_Meas_t *m = UL_Meas_Get();
+        snprintf(buf, sizeof(buf), "%5.0f", (double)m->v_bus);
+        return buf;
+    }
+    case DRV_STATE_STOPPING:  return " STOP ";
+    case DRV_STATE_FAULT:     return "FAULT ";
+    }
+    return "------";
+}
+
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartTask01 */
 /**
-  * @brief  Function implementing the myTask01 thread.
+  * @brief  Task01 — USB CDC init + periodic drive status telemetry (1 Hz)
+  *
+  *         Also performs one-time hardware init:
+  *           1. USB CDC & PHY enable
+  *           2. ADC injected channels (must precede SVPWM to avoid stale reads)
+  *           3. SVPWM timer (counter starts but MOE stays off)
+  *
   * @param  argument: Not used
   * @retval None
   */
@@ -534,88 +614,97 @@ void StartTask01(void const * argument)
   MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 5 */
   HAL_GPIO_WritePin(USB_EN_GPIO_Port, USB_EN_Pin, GPIO_PIN_SET);
+  UL_Display_Init(&huart1);
+  UL_ADC_InjectInit();
   UL_SVPWM_Init();
 
   for(;;)
   {
-    uint32_t bdtr = UL_SVPWM_ReadBDTR();
-    char dbg[120];
+    static const char * const drv_names[] = {
+        "IDLE", "PRCHG", "READY", "RUN", "STOP", "FAULT"
+    };
+    DrvState_t ds = UL_Drive_GetState();
+    if ((int)ds < 0 || (int)ds > 5) ds = DRV_STATE_FAULT;
+    uint16_t   ff = UL_Fault_Get();
+    const UL_Meas_t *m = UL_Meas_Get();
+
+    static char dbg[160];
     int n = snprintf(dbg, sizeof(dbg),
-                     "$DBG,BDTR:%08lX,DTG:%02lX,CCER:%08lX,CR1:%08lX,MOE:%u\r\n",
-                     (unsigned long)bdtr,
-                     (unsigned long)(bdtr & 0xFFU),
-                     (unsigned long)UL_SVPWM_ReadCCER(),
-                     (unsigned long)UL_SVPWM_ReadCR1(),
-                     (unsigned)(bdtr >> 15) & 1U);
+                     "$DRV,S:%s,F:%04X,V:%.1f,S1:%u,S3:%u,BDTR:%08lX,MOE:%u\r\n",
+                     drv_names[(int)ds],
+                     (unsigned)ff,
+                     (double)m->v_bus,
+                     (unsigned)m->shunt1_raw,
+                     (unsigned)m->shunt3_raw,
+                     (unsigned long)UL_SVPWM_ReadBDTR(),
+                     (unsigned)(UL_SVPWM_ReadBDTR() >> 15) & 1U);
     CDC_Transmit_FS((uint8_t *)dbg, (uint16_t)n);
-    osDelay(2000);
+    osDelay(1000);
   }
   /* USER CODE END 5 */
 }
 
 /* USER CODE BEGIN Header_StartTask02 */
 /**
-* @brief Function implementing the myTask02 thread.
-* @param argument: Not used
-* @retval None
-*/
+  * @brief  Task02 — Display communication + VBUS telemetry
+  *
+  *         Every 5 ms: polls display UART RX (button packets)
+  *         Every 100 ms: sends display text + VBUS CDC telemetry
+  *
+  * @param  argument: Not used
+  * @retval None
+  */
 /* USER CODE END Header_StartTask02 */
 void StartTask02(void const * argument)
 {
   /* USER CODE BEGIN StartTask02 */
   osDelay(1000);
+  uint32_t tx_counter = 0;
+
   for(;;)
   {
-    uint16_t raw = UL_ReadVbusMon_Raw();
-    uint32_t adc16 = (uint32_t)raw << 4;
-    float vbus = VBUS_M_OFFSET + (float)adc16 * VBUS_M_GAIN;
-    if (vbus < 0.0f) vbus = 0.0f;
-    char msg[64];
-    int n = snprintf(msg, sizeof(msg),
-                     "$VBUS,RAW:%u,V:%.1f\r\n",
-                     (unsigned)raw, (double)vbus);
-    CDC_Transmit_FS((uint8_t *)msg, (uint16_t)n);
-    osDelay(500);
+    UL_Display_Poll();
+
+    if (++tx_counter >= (DISP_TX_PERIOD_MS / 5U)) {
+        tx_counter = 0;
+
+        UL_Display_SendText(_format_display());
+
+        const UL_Meas_t *m = UL_Meas_Get();
+        float vbus = m->v_bus;
+        if (vbus <= 0.0f) vbus = UL_ReadVbusMon();
+
+        static char msg[64];
+        int n = snprintf(msg, sizeof(msg),
+                         "$VBUS,RAW:%u,V:%.1f\r\n",
+                         (unsigned)m->vbus_raw, (double)vbus);
+        CDC_Transmit_FS((uint8_t *)msg, (uint16_t)n);
+    }
+
+    osDelay(5);
   }
   /* USER CODE END StartTask02 */
 }
 
 /* USER CODE BEGIN Header_StartTask03 */
 /**
-* @brief Function implementing the myTask03 thread.
-* @param argument: Not used
-* @retval None
-*/
+  * @brief  Task03 — Drive state machine tick (every CHG_TICK_MS = 50 ms)
+  *
+  *         Manages: IDLE → PRECHARGE → READY → RUN → STOPPING → IDLE
+  *         Also monitors fault conditions and triggers safe shutdown.
+  *
+  * @param  argument: Not used
+  * @retval None
+  */
 /* USER CODE END Header_StartTask03 */
 void StartTask03(void const * argument)
 {
   /* USER CODE BEGIN StartTask03 */
-  static const char * const state_names[] = {
-      "IDLE", "PRCHG", "VRFY", "RUN", "FAULT"
-  };
-  static const char * const fault_names[] = {
-      "NONE", "TIMEOUT", "OV", "COLLAPSE", "NOCHARGE"
-  };
-
   osDelay(500);
-  UL_Charge_Start();
 
   for(;;)
   {
-    UL_Charge_Tick();
-
-    ChgState_t st = UL_Charge_GetState();
-    ChgFault_t ft = UL_Charge_GetFault();
-    float      v  = UL_Charge_GetVbus();
-
-    char msg[80];
-    int n = snprintf(msg, sizeof(msg),
-                     "$CHG,S:%s,V:%.1f,F:%s\r\n",
-                     state_names[(int)st],
-                     (double)v,
-                     fault_names[(int)ft]);
-    CDC_Transmit_FS((uint8_t *)msg, (uint16_t)n);
-
+    UL_Drive_Tick();
     osDelay(CHG_TICK_MS);
   }
   /* USER CODE END StartTask03 */
@@ -623,10 +712,15 @@ void StartTask03(void const * argument)
 
 /* USER CODE BEGIN Header_StartTask05 */
 /**
-* @brief Function implementing the myTask05 thread.
-* @param argument: Not used
-* @retval None
-*/
+  * @brief  Task05 — DS1232 watchdog heartbeat (every 50 ms, above-normal priority)
+  *
+  *         Toggles SOL_CPU (PG7) to produce a falling edge for the DS1232
+  *         MicroMonitor.  If this task starves for >150 ms the DS1232 asserts
+  *         a system reset.
+  *
+  * @param  argument: Not used
+  * @retval None
+  */
 /* USER CODE END Header_StartTask05 */
 void StartTask05(void const * argument)
 {

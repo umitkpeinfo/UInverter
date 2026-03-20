@@ -2,17 +2,18 @@
 /**
   ******************************************************************************
   * @file    stm32f7xx_it.c
-  * @brief   Interrupt Service Routines.
-  ******************************************************************************
-  * @attention
+  * @brief   UltraLogic R1 — ISR dispatch
   *
-  * Copyright (c) 2026 STMicroelectronics.
-  * All rights reserved.
+  * @details
+  *   Priority map:
+  *     0  TIM1_BRK  — BKIN overcurrent (PE15), clears MOE in hardware
+  *     1  TIM1_UP   — SVPWM duty cycle calculation at f_sw
+  *     5  USART1    — Display MCU RX byte → ring buffer
+  *     7  OTG_FS    — USB CDC
+  *     15 TIM3      — HAL timebase (SysTick replacement for FreeRTOS)
   *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
+  * @company PE Info
+  * @date    2026
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -23,6 +24,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "ul_drivers.h"
+#include "ul_display.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -57,6 +59,7 @@
 
 /* External variables --------------------------------------------------------*/
 extern PCD_HandleTypeDef hpcd_USB_OTG_FS;
+extern UART_HandleTypeDef huart1;
 extern TIM_HandleTypeDef htim3;
 
 /* USER CODE BEGIN EV */
@@ -176,6 +179,21 @@ void TIM3_IRQHandler(void)
 }
 
 /**
+  * @brief This function handles USART1 global interrupt.
+  */
+void USART1_IRQHandler(void)
+{
+  /* USER CODE BEGIN USART1_IRQn 0 */
+  UL_Display_UART_IRQHandler();
+  return;
+  /* USER CODE END USART1_IRQn 0 */
+  HAL_UART_IRQHandler(&huart1);
+  /* USER CODE BEGIN USART1_IRQn 1 */
+
+  /* USER CODE END USART1_IRQn 1 */
+}
+
+/**
   * @brief This function handles USB On The Go FS global interrupt.
   */
 void OTG_FS_IRQHandler(void)
@@ -190,6 +208,21 @@ void OTG_FS_IRQHandler(void)
 }
 
 /* USER CODE BEGIN 1 */
+
+/**
+ * TIM1 Break — hardware overcurrent (BKIN on PE15, active LOW).
+ * Priority 0 (highest).  MOE is already cleared by hardware when we enter.
+ * Write ~BIF (not &= ~BIF) because SR bits are rc_w0: writing 0 clears them.
+ */
+void TIM1_BRK_TIM9_IRQHandler(void)
+{
+    if (TIM1->SR & TIM_SR_BIF) {
+        TIM1->SR = ~TIM_SR_BIF;
+        UL_BKIN_IRQHandler();
+    }
+}
+
+/** TIM1 Update — SVPWM ISR at switching frequency.  Priority 1. */
 void TIM1_UP_TIM10_IRQHandler(void)
 {
     if (__HAL_TIM_GET_FLAG(&htim1, TIM_FLAG_UPDATE) &&
@@ -199,4 +232,5 @@ void TIM1_UP_TIM10_IRQHandler(void)
         UL_SVPWM_ISR();
     }
 }
+
 /* USER CODE END 1 */
