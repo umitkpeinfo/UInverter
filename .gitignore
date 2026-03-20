@@ -1,11 +1,17 @@
 # Build output
 fw/Debug/
 fw/Release/
+fw_display/Debug/
 
 # IDE / STM32CubeIDE
 fw/.settings/
+fw_display/.settings/
 fw/*.launch
+fw_display/*.launch
 .metadata/
+
+# Temp files
+.commitmsg
 
 # Python
 __pycache__/
