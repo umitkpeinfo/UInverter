@@ -402,9 +402,10 @@ static void _dispatch_cmd(const char *line)
       uint32_t   bdtr = UL_SVPWM_ReadBDTR();
       unsigned ct = !HAL_GPIO_ReadPin(BRK_CUR_CPU_GPIO_Port, BRK_CUR_CPU_Pin);
       unsigned dc = UL_Diag_GetCode();
+      unsigned ry = UL_ChargeSwitch_State();
       int n = snprintf((char *)UserTxBufferFS, APP_TX_DATA_SIZE,
                         "$DRV,S:%s,F:%04X,V:%.1f,IU:%.2f,IW:%.2f,"
-                        "S1:%u,S3:%u,BDTR:%08lX,MOE:%u,CT:%u,DC:%u\r\n",
+                        "S1:%u,S3:%u,BDTR:%08lX,MOE:%u,CT:%u,DC:%u,RY:%u\r\n",
                         drv_names[(int)ds],
                         (unsigned)ff,
                         (double)m->v_bus,
@@ -414,7 +415,7 @@ static void _dispatch_cmd(const char *line)
                         (unsigned)m->shunt3_raw,
                         (unsigned long)bdtr,
                         (unsigned)((bdtr >> 15) & 1U),
-                        ct, dc);
+                        ct, dc, ry);
       if (n > 0 && (size_t)n < APP_TX_DATA_SIZE)
           _queue_cmd_reply(UserTxBufferFS, (uint16_t)n);
 

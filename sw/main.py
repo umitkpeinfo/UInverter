@@ -24,7 +24,7 @@ Firmware command set:
 
 Firmware telemetry (periodic, no request needed):
   $DRV,S:<state>,F:<hex>,V:<volts>,IU:<amps>,IW:<amps>,
-       S1:<raw>,S3:<raw>,BDTR:<hex>,MOE:<0|1>,CT:<0|1>,DC:<code>
+       S1:<raw>,S3:<raw>,BDTR:<hex>,MOE:<0|1>,CT:<0|1>,DC:<code>,RY:<0|1>
   $VBUS,RAW:<raw>,V:<volts>
 
 Dependencies: pip install PySide6 pyserial
@@ -498,9 +498,12 @@ class MainWindow(QMainWindow):
             volts = float(parts.get("V", "0"))
             i_u = float(parts.get("IU", "0"))
             i_w = float(parts.get("IW", "0"))
+            s1_raw = int(parts.get("S1", "0"))
+            s3_raw = int(parts.get("S3", "0"))
             moe = parts.get("MOE", "")
             cur_trip = parts.get("CT", "0")
             diag_code = int(parts.get("DC", "0"))
+            relay = parts.get("RY", "0")
             fault_val = int(fault_hex, 16) if fault_hex else 0
         except (ValueError, KeyError):
             return
@@ -529,6 +532,12 @@ class MainWindow(QMainWindow):
             f"color: {ACCENT_GREEN if moe_on else FG_DIM};"
             f"font-size: 10pt; font-weight: bold; {MONO}")
 
+        ry_on = relay == "1"
+        self._ry_lbl.setText(f"RELAY: {'ON' if ry_on else 'OFF'}")
+        self._ry_lbl.setStyleSheet(
+            f"color: {ACCENT_YELLOW if ry_on else FG_DIM};"
+            f"font-size: 10pt; font-weight: bold; {MONO}")
+
         tripped = cur_trip == "1"
         if tripped:
             self._ct_lbl.setText("CUR_TRIP ACTIVE")
@@ -546,6 +555,7 @@ class MainWindow(QMainWindow):
             f"color: {shunt_color}; font-size: 10pt; {MONO}")
 
         self._update_vbus_display(volts)
+        self._update_adc_display(s1_raw, s3_raw, i_u, i_w, volts)
 
     def _parse_btn(self, line: str) -> None:
         try:
@@ -592,6 +602,15 @@ class MainWindow(QMainWindow):
             f"color: {color}; font-size: 24pt; font-weight: bold; {MONO}")
         if raw is not None:
             self._vbus_raw.setText(f"RAW {raw}")
+            self._adc_vbus_lbl.setText(f"{raw}")
+
+    def _update_adc_display(self, s1: int, s3: int,
+                            i_u: float, i_w: float, vbus: float) -> None:
+        self._adc_s1_lbl.setText(f"{s1}")
+        self._adc_s3_lbl.setText(f"{s3}")
+        self._adc_iu_lbl.setText(f"{i_u:+.2f} A")
+        self._adc_iw_lbl.setText(f"{i_w:+.2f} A")
+        self._adc_vbus_v_lbl.setText(f"{vbus:.1f} V")
 
     # ── Command Handlers ─────────────────────────────────────────────
 
@@ -713,6 +732,11 @@ class MainWindow(QMainWindow):
             f"color: {FG_DIM}; font-size: 10pt; font-weight: bold; {MONO}")
         self._moe_lbl.setAlignment(Qt.AlignCenter)
         status_row.addWidget(self._moe_lbl)
+        self._ry_lbl = QLabel("RELAY: OFF")
+        self._ry_lbl.setStyleSheet(
+            f"color: {FG_DIM}; font-size: 10pt; font-weight: bold; {MONO}")
+        self._ry_lbl.setAlignment(Qt.AlignCenter)
+        status_row.addWidget(self._ry_lbl)
         self._ct_lbl = QLabel("")
         self._ct_lbl.setAlignment(Qt.AlignCenter)
         status_row.addWidget(self._ct_lbl)
@@ -931,6 +955,55 @@ class MainWindow(QMainWindow):
         disp_lo.addWidget(self._btn_lbl)
 
         right.addWidget(disp_group)
+
+        adc_group = QGroupBox("ADC CHANNELS")
+        adc_lo = QGridLayout(adc_group)
+        adc_lo.setSpacing(4)
+
+        adc_channels = [
+            ("S1  (IU raw)",  "ADC1 IN5  PA5",  ACCENT_RED),
+            ("S3  (IW raw)",  "ADC3 IN7  PF9",  ACCENT_CYAN),
+            ("VBUS raw",      "ADC3 IN6  PF8",  ACCENT_YELLOW),
+        ]
+        self._adc_s1_lbl = QLabel("---")
+        self._adc_s3_lbl = QLabel("---")
+        self._adc_vbus_lbl = QLabel("---")
+        self._adc_iu_lbl = QLabel("--- A")
+        self._adc_iw_lbl = QLabel("--- A")
+        self._adc_vbus_v_lbl = QLabel("--- V")
+
+        raw_labels = [self._adc_s1_lbl, self._adc_s3_lbl, self._adc_vbus_lbl]
+        eng_labels = [self._adc_iu_lbl, self._adc_iw_lbl, self._adc_vbus_v_lbl]
+
+        hdr_style = f"color: {FG_DIM}; font-size: 8pt; font-weight: bold; {MONO}"
+        adc_lo.addWidget(QLabel(""), 0, 0)
+        for col, txt in enumerate(["RAW", "VALUE"], 1):
+            h = QLabel(txt)
+            h.setStyleSheet(hdr_style)
+            h.setAlignment(Qt.AlignCenter)
+            adc_lo.addWidget(h, 0, col)
+
+        for row, (name, pin, color) in enumerate(adc_channels, 1):
+            name_lbl = QLabel(name)
+            name_lbl.setStyleSheet(
+                f"color: {color}; font-size: 9pt; font-weight: bold; {MONO}")
+            name_lbl.setToolTip(pin)
+            adc_lo.addWidget(name_lbl, row, 0)
+
+            rl = raw_labels[row - 1]
+            rl.setStyleSheet(f"color: {FG_PRIMARY}; font-size: 11pt; {MONO}")
+            rl.setAlignment(Qt.AlignCenter)
+            adc_lo.addWidget(rl, row, 1)
+
+            el = eng_labels[row - 1]
+            el.setStyleSheet(f"color: {FG_PRIMARY}; font-size: 11pt; {MONO}")
+            el.setAlignment(Qt.AlignCenter)
+            adc_lo.addWidget(el, row, 2)
+
+        adc_lo.setColumnStretch(0, 3)
+        adc_lo.setColumnStretch(1, 2)
+        adc_lo.setColumnStretch(2, 2)
+        right.addWidget(adc_group)
 
         query_group = QGroupBox("DIAGNOSTICS")
         query_lo = QVBoxLayout(query_group)

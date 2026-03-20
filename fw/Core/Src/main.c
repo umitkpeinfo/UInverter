@@ -313,7 +313,7 @@ static void MX_ADC3_Init(void)
   hadc3.Instance = ADC3;
   hadc3.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
   hadc3.Init.Resolution = ADC_RESOLUTION_12B;
-  hadc3.Init.ScanConvMode = ADC_SCAN_DISABLE;
+  hadc3.Init.ScanConvMode = ADC_SCAN_ENABLE;
   hadc3.Init.ContinuousConvMode = DISABLE;
   hadc3.Init.DiscontinuousConvMode = DISABLE;
   hadc3.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
@@ -337,7 +337,12 @@ static void MX_ADC3_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN ADC3_Init 2 */
-
+  /* IMPORTANT: CubeMX must set ADC3 Scan Conversion Mode = ENABLE.
+     ADC3 has 2 injected channels (SHUNT3 + VBUS_MON); scan mode is
+     required for the HAL to honour InjectedNbrOfConversion > 1.
+     If CubeMX regenerates with Scan=Disable, JDR2 reads 0 → 1452 V ghost. */
+  hadc3.Init.ScanConvMode = ADC_SCAN_ENABLE;
+  HAL_ADC_Init(&hadc3);
   /* USER CODE END ADC3_Init 2 */
 
 }
@@ -582,10 +587,12 @@ static const char *_format_display(void)
         return buf;
     }
 
+    uint8_t ry = UL_ChargeSwitch_State();
+
     switch (UL_Drive_GetState()) {
-    case DRV_STATE_IDLE:      return " IDLE ";
-    case DRV_STATE_PRECHARGE: return " PRCHG";
-    case DRV_STATE_READY:     return " READY";
+    case DRV_STATE_IDLE:      return ry ? "RLY ON" : " IDLE ";
+    case DRV_STATE_PRECHARGE: return ry ? "CHG ON" : "CHG OF";
+    case DRV_STATE_READY:     return ry ? "RDY ON" : "RDY OF";
     case DRV_STATE_RUN:
         snprintf(buf, sizeof(buf), "%5.0f", (double)UL_Meas_Get()->v_bus);
         return buf;
@@ -634,10 +641,11 @@ void StartTask01(void const * argument)
     unsigned    cur_trip = !HAL_GPIO_ReadPin(BRK_CUR_CPU_GPIO_Port,
                                             BRK_CUR_CPU_Pin);
     uint8_t          dc  = UL_Diag_GetCode();
+    unsigned         ry  = UL_ChargeSwitch_State();
     static char dbg[224];
     int n = snprintf(dbg, sizeof(dbg),
                      "$DRV,S:%s,F:%04X,V:%.1f,IU:%.2f,IW:%.2f,"
-                     "S1:%u,S3:%u,BDTR:%08lX,MOE:%u,CT:%u,DC:%u\r\n",
+                     "S1:%u,S3:%u,BDTR:%08lX,MOE:%u,CT:%u,DC:%u,RY:%u\r\n",
                      drv_names[(int)ds],
                      (unsigned)ff,
                      (double)m->v_bus, (double)m->i_u, (double)m->i_w,
@@ -645,7 +653,8 @@ void StartTask01(void const * argument)
                      (unsigned long)bdtr,
                      (unsigned)((bdtr >> 15) & 1U),
                      cur_trip,
-                     (unsigned)dc);
+                     (unsigned)dc,
+                     ry);
     if (n > 0 && (size_t)n < sizeof(dbg))
         CDC_Transmit_FS((uint8_t *)dbg, (uint16_t)n);
     osDelay(DRV_TELEMETRY_MS);
@@ -713,6 +722,7 @@ void StartTask03(void const * argument)
 
   for(;;)
   {
+    UL_Charge_Tick();
     UL_Drive_Tick();
     osDelay(CHG_TICK_MS);
   }

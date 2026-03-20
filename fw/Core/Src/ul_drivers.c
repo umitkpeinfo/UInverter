@@ -749,7 +749,7 @@ static float _fabsf(float x) { return x < 0.0f ? -x : x; }
 
 void UL_Charge_Start(void)
 {
-    UL_ChargeSwitch(0);
+    if (chg_state != CHG_STATE_IDLE) return;
     chg_vbus_prev  = 0.0f;
     chg_vbus_close = 0.0f;
     chg_elapsed_ms = 0;
@@ -774,43 +774,75 @@ void UL_Charge_ClearFault(void)
     }
 }
 
+/**
+ * Autonomous charge relay controller — runs every CHG_TICK_MS.
+ *
+ * Purely VBUS-driven, independent of the SVPWM drive state machine:
+ *   IDLE → auto-starts PRECHARGE when VBUS >= CHG_MIN_V
+ *   PRECHARGE → closes relay when VBUS is stable (dV < 5V for 300 ms)
+ *   VERIFY → confirms bus didn't collapse after relay close
+ *   RUNNING → relay stays closed; opens on bus drop or system fault
+ *
+ * System faults (overcurrent, etc.) open the relay immediately;
+ * the charge will auto-restart once faults are cleared and VBUS returns.
+ */
 void UL_Charge_Tick(void)
 {
     float vbus    = UL_ReadVbusMon();
     chg_vbus_last = vbus;
 
-    if (chg_state != CHG_STATE_IDLE && chg_state != CHG_STATE_FAULT) {
-        if (vbus > CHG_OV_V) {
+    /* System fault → open relay, return to IDLE.
+       Will auto-restart when fault is cleared and VBUS recovers. */
+    if (UL_Fault_IsTripped()) {
+        if (chg_state == CHG_STATE_RUNNING || chg_state == CHG_STATE_VERIFY)
             UL_ChargeSwitch(0);
-            chg_fault = CHG_FAULT_OVERVOLTAGE;
-            chg_state = CHG_STATE_FAULT;
-            UL_Fault_Set(FAULT_OVERVOLTAGE, DIAG_F_PRECHG_OV);
-            return;
-        }
+        chg_state    = CHG_STATE_IDLE;
+        chg_stable_n = 0;
+        return;
+    }
+
+    /* OV protection — active in all states except IDLE */
+    if (chg_state != CHG_STATE_IDLE && vbus > CHG_OV_V) {
+        UL_ChargeSwitch(0);
+        chg_state = CHG_STATE_IDLE;
+        UL_Fault_Set(FAULT_OVERVOLTAGE, DIAG_F_PRECHG_OV);
+        return;
     }
 
     switch (chg_state) {
 
     case CHG_STATE_IDLE:
+        /* Auto-start precharge when VBUS rises above minimum */
+        if (vbus >= CHG_MIN_V) {
+            chg_vbus_prev  = vbus;
+            chg_vbus_close = 0.0f;
+            chg_elapsed_ms = 0;
+            chg_stable_n   = 0;
+            chg_fault      = CHG_FAULT_NONE;
+            chg_state      = CHG_STATE_PRECHARGE;
+        }
         break;
 
     case CHG_STATE_PRECHARGE:
         chg_elapsed_ms += CHG_TICK_MS;
 
-        if (chg_elapsed_ms > CHG_TIMEOUT_MS) {
-            chg_fault = (vbus < CHG_MIN_V)
-                        ? CHG_FAULT_NO_CHARGE
-                        : CHG_FAULT_TIMEOUT;
-            chg_state = CHG_STATE_FAULT;
+        if (vbus < CHG_MIN_V) {
+            chg_stable_n   = 0;
+            chg_elapsed_ms = 0;
+            chg_state      = CHG_STATE_IDLE;
             return;
         }
 
-        if (vbus >= CHG_MIN_V) {
-            if (_fabsf(vbus - chg_vbus_prev) < CHG_STABLE_DV)
-                chg_stable_n++;
-            else
-                chg_stable_n = 0;
+        if (chg_elapsed_ms > CHG_TIMEOUT_MS) {
+            chg_fault = CHG_FAULT_TIMEOUT;
+            chg_state = CHG_STATE_IDLE;
+            return;
         }
+
+        if (_fabsf(vbus - chg_vbus_prev) < CHG_STABLE_DV)
+            chg_stable_n++;
+        else
+            chg_stable_n = 0;
         chg_vbus_prev = vbus;
 
         if (chg_stable_n >= CHG_STABLE_N) {
@@ -827,7 +859,7 @@ void UL_Charge_Tick(void)
         if (vbus < chg_vbus_close - CHG_COLLAPSE_V) {
             UL_ChargeSwitch(0);
             chg_fault = CHG_FAULT_BUS_COLLAPSE;
-            chg_state = CHG_STATE_FAULT;
+            chg_state = CHG_STATE_IDLE;
             return;
         }
 
@@ -839,8 +871,7 @@ void UL_Charge_Tick(void)
     case CHG_STATE_RUNNING:
         if (vbus < CHG_MIN_V) {
             UL_ChargeSwitch(0);
-            chg_fault = CHG_FAULT_BUS_COLLAPSE;
-            chg_state = CHG_STATE_FAULT;
+            chg_state = CHG_STATE_IDLE;
         }
         break;
 
@@ -857,9 +888,14 @@ uint8_t     UL_Charge_BusReady(void) { return chg_state == CHG_STATE_RUNNING ? 1
 /* ══════════════════════════════════════════════════════════════════════
  *  Drive State Machine
  *
- *  IDLE → PRECHARGE → READY → RUN → STOPPING → IDLE
- *                                                 ↑
- *  Any state → FAULT → (clear) ───────────────────┘
+ *  IDLE → PRECHARGE → READY → RUN → IDLE
+ *                                     ↑
+ *  Any state → FAULT → (reset) ───────┘
+ *
+ *  The charge relay is managed INDEPENDENTLY by UL_Charge_Tick().
+ *  PRECHARGE simply waits for UL_Charge_BusReady() — no relay control.
+ *  Drive Stop/Reset do NOT touch the relay; it stays closed if VBUS
+ *  is healthy, allowing immediate re-start without a new precharge.
  * ══════════════════════════════════════════════════════════════════════ */
 
 DrvState_t UL_Drive_GetState(void) { return drv_state; }
@@ -868,7 +904,7 @@ void UL_Drive_Start(void)
 {
     if (drv_state != DRV_STATE_IDLE) return;
     if (UL_Fault_IsTripped()) return;
-    UL_Charge_Start();
+    /* Relay is managed autonomously by UL_Charge_Tick(). */
     drv_state = DRV_STATE_PRECHARGE;
 }
 
@@ -892,8 +928,7 @@ void UL_Drive_Stop(void)
     if (drv_state == DRV_STATE_IDLE || drv_state == DRV_STATE_FAULT) return;
 
     UL_SVPWM_Disable();
-    UL_ChargeSwitch(0);
-    UL_Charge_Stop();
+    /* Relay is NOT touched — charge controller manages it autonomously. */
     regen_active = 0;
     HAL_GPIO_WritePin(BRK_ON_GPIO_Port, BRK_ON_Pin, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(BRK_EN_GPIO_Port, BRK_EN_Pin, GPIO_PIN_RESET);
@@ -903,8 +938,7 @@ void UL_Drive_Stop(void)
 void UL_Drive_Reset(void)
 {
     UL_SVPWM_Disable();
-    UL_ChargeSwitch(0);
-    UL_Charge_Stop();
+    /* Relay is NOT touched — charge controller manages it autonomously. */
     UL_Fault_Clear();
     regen_active = 0;
     HAL_GPIO_WritePin(BRK_ON_GPIO_Port, BRK_ON_Pin, GPIO_PIN_RESET);
@@ -916,7 +950,7 @@ void UL_Drive_Tick(void)
 {
     if (UL_Fault_IsTripped() && drv_state != DRV_STATE_FAULT) {
         UL_SVPWM_Disable();
-        UL_ChargeSwitch(0);
+        /* Relay opened by UL_Charge_Tick() on fault detection */
         drv_state = DRV_STATE_FAULT;
         return;
     }
@@ -927,20 +961,9 @@ void UL_Drive_Tick(void)
         break;
 
     case DRV_STATE_PRECHARGE:
-        UL_Charge_Tick();
-        if (UL_Charge_GetState() == CHG_STATE_RUNNING) {
+        /* Just wait — relay is managed by the autonomous charge controller */
+        if (UL_Charge_BusReady()) {
             drv_state = DRV_STATE_READY;
-        } else if (UL_Charge_GetState() == CHG_STATE_FAULT) {
-            uint8_t pchg_diag;
-            switch (UL_Charge_GetFault()) {
-            case CHG_FAULT_TIMEOUT:      pchg_diag = DIAG_F_PRECHG_TIMEOUT;  break;
-            case CHG_FAULT_BUS_COLLAPSE: pchg_diag = DIAG_F_PRECHG_COLLAPSE; break;
-            case CHG_FAULT_NO_CHARGE:    pchg_diag = DIAG_F_NO_CHARGE;       break;
-            case CHG_FAULT_OVERVOLTAGE:  pchg_diag = DIAG_F_PRECHG_OV;       break;
-            default:                     pchg_diag = DIAG_F_PRECHG_TIMEOUT;  break;
-            }
-            UL_Fault_Set(FAULT_PRECHARGE, pchg_diag);
-            drv_state = DRV_STATE_FAULT;
         }
         break;
 
@@ -961,8 +984,7 @@ void UL_Drive_Tick(void)
 
     case DRV_STATE_STOPPING:
         UL_SVPWM_Disable();
-        UL_ChargeSwitch(0);
-        UL_Charge_Stop();
+        /* Relay is NOT touched — charge controller manages it autonomously. */
         drv_state = DRV_STATE_IDLE;
         break;
 

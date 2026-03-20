@@ -242,6 +242,12 @@ void UL_Display_SendSegment(const char *text, uint8_t effect)
     if (payload_len > DISP_NUM_DIGITS)
         payload_len = DISP_NUM_DIGITS;
 
+    /* Reverse text: display board has DIG0 on the right, DIG5 on the left,
+       so the first character must go into the last position. */
+    char rev[DISP_NUM_DIGITS];
+    for (uint8_t i = 0; i < payload_len; i++)
+        rev[payload_len - 1U - i] = text[i];
+
     /* Total packet: $LLTTCCEE + text */
     uint8_t total_len = DISP_HEADER_LEN + 2U + payload_len;
     if (total_len > DISP_MAX_PACKET_LEN)
@@ -256,8 +262,8 @@ void UL_Display_SendSegment(const char *text, uint8_t effect)
     pkt[6] = '0';
     /* Effect byte */
     _hex2_encode(&pkt[7], effect);
-    /* Display text */
-    memcpy(&pkt[9], text, payload_len);
+    /* Display text (reversed for hardware digit order) */
+    memcpy(&pkt[9], rev, payload_len);
 
     /* Calculate and insert checksum */
     uint8_t cksum = _calc_checksum(pkt, total_len);
